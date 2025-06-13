@@ -66,6 +66,11 @@ def _parse_args():
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
     parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Whether to torch.compile the denoiser.",
+    )
+    parser.add_argument(
         "--size",
         type=str,
         default="multitalk-480",
@@ -81,13 +86,14 @@ def _parse_args():
     parser.add_argument(
         "--ckpt_dir",
         type=str,
-        default=None,
+        default="/runware/steph/MultiTalk/weights/Wan2.1-I2V-14B-480P",
         help="The path to the Wan checkpoint directory.")
     parser.add_argument(
         "--wav2vec_dir",
         type=str,
-        default=None,
+        default="./weights/chinese-wav2vec2-base",
         help="The path to the wav2vec checkpoint directory.")
+
     parser.add_argument(
         "--offload_model",
         type=str2bool,
@@ -104,6 +110,12 @@ def _parse_args():
         type=int,
         default=1,
         help="The size of the ring attention parallelism in DiT.")
+    parser.add_argument(
+        "--para_batch_size",
+        type=int,
+        default=1,
+        help="The batch size for each parallel process. This is only used when the model is trained with parallel batch size."
+    )
     parser.add_argument(
         "--t5_fsdp",
         action="store_true",
@@ -137,7 +149,7 @@ def _parse_args():
     parser.add_argument(
         "--input_json",
         type=str,
-        default='examples.json',
+        default='examples/single_example_1.json',
         help="[meta file] The condition path to generate the video.")
     parser.add_argument(
         "--motion_frame",
@@ -151,7 +163,11 @@ def _parse_args():
         choices=['clip', 'streaming'],
         help="clip: generate one video chunk, streaming: long video generation")
     parser.add_argument(
-        "--sample_steps", type=int, default=None, help="The sampling steps.")
+        "--sample_steps", type=int, default=10, help="The sampling steps.")
+    parser.add_argument(
+        "--batched_cfg",
+        action="store_true",
+    )
     parser.add_argument(
         "--sample_shift",
         type=float,
@@ -174,7 +190,7 @@ def _parse_args():
 
     return args
 
-def custom_init(device, wav2vec):    
+def custom_init(device, wav2vec):
     audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True).to(device)
     audio_encoder.feature_extractor._freeze_parameters()
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec, local_files_only=True)
@@ -204,7 +220,7 @@ def audio_prepare_multi(left_path, right_path, audio_type, sample_rate=16000):
         new_human_speech1 = human_speech_array1
         new_human_speech2 = human_speech_array2
     elif audio_type=='add':
-        new_human_speech1 = np.concatenate([human_speech_array1[: human_speech_array1.shape[0]], np.zeros(human_speech_array2.shape[0])]) 
+        new_human_speech1 = np.concatenate([human_speech_array1[: human_speech_array1.shape[0]], np.zeros(human_speech_array2.shape[0])])
         new_human_speech2 = np.concatenate([np.zeros(human_speech_array1.shape[0]), human_speech_array2[:human_speech_array2.shape[0]]])
     sum_human_speechs = new_human_speech1 + new_human_speech2
     return new_human_speech1, new_human_speech2, sum_human_speechs
@@ -304,8 +320,10 @@ def generate(args):
             args.ulysses_size > 1 or args.ring_size > 1
         ), f"context parallel are not supported in non-distributed environments."
 
-    if args.ulysses_size > 1 or args.ring_size > 1:
-        assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
+    if args.ulysses_size > 1 or args.ring_size > 1 or args.para_batch_size > 1:
+        assert args.ulysses_size * args.ring_size * args.para_batch_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
+        assert args.para_batch_size == 1 or args.para_batch_size == 3, f"The para_batch_size should be 1 or 3, but got {args.para_batch_size}."
+
         from xfuser.core.distributed import (
             init_distributed_environment,
             initialize_model_parallel,
@@ -314,7 +332,8 @@ def generate(args):
             rank=dist.get_rank(), world_size=dist.get_world_size())
 
         initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
+            classifier_free_guidance_degree=args.para_batch_size,
+            sequence_parallel_degree = args.ulysses_size * args.ring_size,
             ring_degree=args.ring_size,
             ulysses_degree=args.ulysses_size,
         )
@@ -347,7 +366,7 @@ def generate(args):
         args.base_seed = base_seed[0]
 
     assert args.task == "multitalk-14B", 'You should choose multitalk in args.task.'
-    
+
 
     # TODO: add prompt refine
     # img = Image.open(args.image).convert("RGB")
@@ -376,15 +395,15 @@ def generate(args):
 
     # read input files
 
-    
+
 
     with open(args.input_json, 'r', encoding='utf-8') as f:
         input_data = json.load(f)
-        
+
         wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
         args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
         os.makedirs(args.audio_save_dir,exist_ok=True)
-        
+
         if len(input_data['cond_audio'])==2:
             new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
             audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
@@ -415,10 +434,15 @@ def generate(args):
         device_id=device,
         rank=rank,
         t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp, 
-        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),  
+        dit_fsdp=args.dit_fsdp,
+        use_usp=(args.ulysses_size > 1 or args.ring_size > 1 or args.para_batch_size > 1),
         t5_cpu=args.t5_cpu,
     )
+
+    if args.compile:
+        wan_i2v.model = torch.compile(
+            wan_i2v.model,
+        )
 
     logging.info("Generating video ...")
     video = wan_i2v.generate(
@@ -433,20 +457,21 @@ def generate(args):
         seed=args.base_seed,
         offload_model=args.offload_model,
         max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
-        )
-    
+        batched_cfg=args.batched_cfg,
+    )
+
 
     if rank == 0:
-        
+
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = input_data['prompt'].replace(" ", "_").replace("/",
                                                                         "_")[:50]
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
-        
+
         logging.info(f"Saving generated video to {args.save_file}.mp4")
         save_video_ffmpeg(video, args.save_file, [input_data['video_audio']])
-        
+
     logging.info("Finished.")
 
 

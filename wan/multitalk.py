@@ -44,23 +44,23 @@ def resize_and_centercrop(cond_image, target_size):
             orig_h, orig_w = cond_image.height, cond_image.width
 
         target_h, target_w = target_size
-        
+
         # Calculate the scaling factor for resizing
         scale_h = target_h / orig_h
         scale_w = target_w / orig_w
-        
+
         # Compute the final size
         scale = max(scale_h, scale_w)
         final_h = math.ceil(scale * orig_h)
         final_w = math.ceil(scale * orig_w)
-        
+
         # Resize
         if isinstance(cond_image, torch.Tensor):
             if len(cond_image.shape) == 3:
                 cond_image = cond_image[None]
-            resized_tensor = nn.functional.interpolate(cond_image, size=(final_h, final_w), mode='nearest').contiguous() 
+            resized_tensor = nn.functional.interpolate(cond_image, size=(final_h, final_w), mode='nearest').contiguous()
             # crop
-            cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size) 
+            cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
             cropped_tensor = cropped_tensor.squeeze(0)
         else:
             resized_image = cond_image.resize((final_w, final_h), resample=Image.BILINEAR)
@@ -68,7 +68,7 @@ def resize_and_centercrop(cond_image, target_size):
             # tensor and crop
             resized_tensor = torch.from_numpy(resized_image)[None, ...].permute(0, 3, 1, 2).contiguous()
             cropped_tensor = transforms.functional.center_crop(resized_tensor, target_size)
-            cropped_tensor = cropped_tensor[:, :, None, :, :] 
+            cropped_tensor = cropped_tensor[:, :, None, :, :]
 
         return cropped_tensor
 
@@ -187,7 +187,7 @@ class MultiTalkPipeline:
         else:
             if not init_on_cpu:
                 self.model.to(self.device)
-        
+
         self.model.to(self.param_dtype)
         self.sample_neg_prompt = config.sample_neg_prompt
         self.num_timesteps = num_timesteps
@@ -223,7 +223,8 @@ class MultiTalkPipeline:
                  offload_model=True,
                  max_frames_num=1000,
                  face_scale=0.05,
-                 progress=True):
+                 progress=True,
+                 batched_cfg=False):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -245,8 +246,8 @@ class MultiTalkPipeline:
         input_prompt = input_data['prompt']
         cond_file_path = input_data['cond_image']
         cond_image = Image.open(cond_file_path).convert('RGB')
-        
-        
+
+
         # decide a proper size
         bucket_config_module = importlib.import_module("wan.utils.multitalk_utils")
         if size_buckget == 'multitalk-480':
@@ -274,10 +275,10 @@ class MultiTalkPipeline:
             HUMAN_NUMBER = 2
             audio_embedding_path_2 = input_data['cond_audio']['person2']
 
-        
-        full_audio_embs = []        
+
+        full_audio_embs = []
         audio_embedding_paths = [audio_embedding_path_1, audio_embedding_path_2]
-        for human_idx in range(HUMAN_NUMBER):   
+        for human_idx in range(HUMAN_NUMBER):
             audio_embedding_path = audio_embedding_paths[human_idx]
             if not os.path.exists(audio_embedding_path):
                 continue
@@ -287,7 +288,7 @@ class MultiTalkPipeline:
             if full_audio_emb.shape[0] <= frame_num:
                 continue
             full_audio_embs.append(full_audio_emb) # [(F, 5, 12, 768), ...]
-        
+
         assert len(full_audio_embs) == HUMAN_NUMBER, f"Aduio file not exists or length not satisfies frame nums."
 
         # preprocess text embedding
@@ -306,7 +307,7 @@ class MultiTalkPipeline:
 
 
         # prepare params for video generation
-        indices = (torch.arange(2 * 2 + 1) - 2) * 1 
+        indices = (torch.arange(2 * 2 + 1) - 2) * 1
         clip_length = frame_num
         is_first_clip = True
         arrive_last_frame = False
@@ -328,7 +329,7 @@ class MultiTalkPipeline:
         while True:
             audio_embs = []
             # split audio with window size
-            for human_idx in range(HUMAN_NUMBER):   
+            for human_idx in range(HUMAN_NUMBER):
                 center_indices = torch.arange(
                     audio_start_idx,
                     audio_end_idx,
@@ -355,7 +356,7 @@ class MultiTalkPipeline:
                 lat_h,
                 lat_w,
                 dtype=torch.float32,
-                device=self.device) 
+                device=self.device)
 
             # get mask
             msk = torch.ones(1, frame_num, lat_h, lat_w, device=self.device)
@@ -378,13 +379,13 @@ class MultiTalkPipeline:
                 # zero padding and vae encode
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
                 padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
-                y = self.vae.encode(padding_frames_pixels_values) 
+                y = self.vae.encode(padding_frames_pixels_values)
                 y = torch.stack(y).to(self.param_dtype) # B C T H W
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
                 latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0] # C T H W
                 y = torch.concat([msk, y], dim=1) # B 4+C T H W
                 if offload_model: torch_gc()
-            
+
 
             # construct human mask
             human_masks = []
@@ -420,13 +421,13 @@ class MultiTalkPipeline:
                 background_mask = torch.where(background_mask > 0, torch.tensor(0), torch.tensor(1))
                 human_masks.append(background_mask)
 
-            ref_target_masks = torch.stack(human_masks, dim=0).to(self.device)
-            # resize and centercrop for ref_target_masks 
+            ref_target_masks = torch.stack(human_masks, dim=0).to(self.device, dtype=self.param_dtype)  # 3 C H W
+            # resize and centercrop for ref_target_masks
             ref_target_masks = resize_and_centercrop(ref_target_masks, (target_h, target_w))
 
             _, _, _,lat_h, lat_w = y.shape
-            ref_target_masks = F.interpolate(ref_target_masks.unsqueeze(0), size=(lat_h, lat_w), mode='nearest').squeeze() 
-            ref_target_masks = (ref_target_masks > 0) 
+            ref_target_masks = F.interpolate(ref_target_masks.unsqueeze(0), size=(lat_h, lat_w), mode='nearest').squeeze()
+            ref_target_masks = (ref_target_masks > 0)
             ref_target_masks = ref_target_masks.float().to(self.device)
 
             if offload_model: torch_gc()
@@ -439,14 +440,14 @@ class MultiTalkPipeline:
 
             # evaluation mode
             with torch.no_grad(), no_sync():
-                
+
                 # prepare timesteps
                 timesteps = list(np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32))
                 timesteps.append(0.)
                 timesteps = [torch.tensor([t], device=self.device) for t in timesteps]
                 if self.use_timestep_transform:
                     timesteps = [timestep_transform(t, shift=shift, num_timesteps=self.num_timesteps) for t in timesteps]
-                
+
                 # sample videos
                 latent = noise
 
@@ -480,6 +481,25 @@ class MultiTalkPipeline:
                     'ref_target_masks': ref_target_masks
                 }
 
+                cfg_size = 3
+                if batched_cfg:
+                    arg_batched = {
+                        'context': [
+                            context,
+                            context_null,
+                            context_null
+                        ],
+                        'clip_fea': torch.cat([clip_context] * cfg_size, dim=0),
+                        'seq_len': max_seq_len,
+                        'y': torch.cat([y] * cfg_size, dim=0),
+                        'audio': torch.cat([
+                            audio_embs,
+                            audio_embs,
+                            torch.zeros_like(audio_embs)[-1:]
+                        ], dim=0),
+                        'ref_target_masks': ref_target_masks
+                    }
+
                 if offload_model: torch_gc()
                 self.model.to(self.device)
 
@@ -491,26 +511,35 @@ class MultiTalkPipeline:
                     _, T_m, _, _ = add_latent.shape
                     latent[:, :T_m] = add_latent
 
-                
+
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
                 for i in progress_wrap(range(len(timesteps)-1)):
                     timestep = timesteps[i]
-                    latent_model_input = [latent.to(self.device)]
 
                     # inference with CFG strategy
-                    noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0] 
-                    if offload_model: torch_gc()
-                    noise_pred_drop_text = self.model(
-                        latent_model_input, t=timestep, **arg_null_text)[0] 
-                    if offload_model: torch_gc()
-                    noise_pred_uncond = self.model(
-                        latent_model_input, t=timestep, **arg_null)[0]  
-                    if offload_model: torch_gc()
-                    noise_pred = noise_pred_uncond + text_guide_scale * (
-                        noise_pred_cond - noise_pred_drop_text) + \
-                        audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)  
-                    noise_pred = -noise_pred  
+                    if batched_cfg:
+                        latent_model_input = latent.to(self.device, dtype = self.param_dtype)
+                        latent_model_input = [latent_model_input, latent_model_input, latent_model_input]
+                        noise_pred = self.model(latent_model_input, t=timestep, **arg_batched)
+                        noise_pred_cond, noise_pred_drop_text, noise_pred_uncond = noise_pred.chunk(3)
+                        noise_pred_cond = noise_pred_cond[0]
+                        noise_pred_drop_text = noise_pred_drop_text[0]
+                        noise_pred_uncond = noise_pred_uncond[0]
+
+                        if offload_model: torch_gc()
+
+                    else:
+                        latent_model_input = [latent.to(self.device, dtype = self.param_dtype)]
+                        noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[0]
+                        if offload_model: torch_gc()
+                        noise_pred_drop_text = self.model( latent_model_input, t=timestep, **arg_null_text)[0]
+                        if offload_model: torch_gc()
+                        noise_pred_uncond = self.model( latent_model_input, t=timestep, **arg_null)[0]
+                        if offload_model: torch_gc()
+
+                    noise_pred = noise_pred_uncond + text_guide_scale * ( noise_pred_cond - noise_pred_drop_text) + audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
+
+                    noise_pred = -noise_pred
 
                     # update latent
                     dt = timesteps[i] - timesteps[i + 1]
@@ -527,13 +556,13 @@ class MultiTalkPipeline:
 
                     x0 = [latent.to(self.device)] # [(C T H W)]
                     del latent_model_input, timestep
-                
-                if offload_model: 
+
+                if offload_model:
                     self.model.cpu()
                     torch_gc()
 
-                videos = self.vae.decode(x0) 
-            
+                videos = self.vae.decode(x0)
+
             # cache generated samples
             videos = torch.stack(videos).cpu() # B C T H W
             if is_first_clip:
@@ -561,13 +590,13 @@ class MultiTalkPipeline:
                     source_frame = len(full_audio_embs[human_inx])
                     source_frames.append(source_frame)
                     if audio_end_idx >= len(full_audio_embs[human_inx]):
-                        miss_length   = audio_end_idx - len(full_audio_embs[human_inx]) + 3 
+                        miss_length   = audio_end_idx - len(full_audio_embs[human_inx]) + 3
                         add_audio_emb = torch.flip(full_audio_embs[human_inx][-1*miss_length:], dims=[0])
                         full_audio_embs[human_inx] = torch.cat([full_audio_embs[human_inx], add_audio_emb], dim=0)
                         miss_lengths.append(miss_length)
                     else:
                         miss_lengths.append(0)
-            
+
             if max_frames_num <= frame_num: break
 
             if offload_model:
@@ -575,13 +604,13 @@ class MultiTalkPipeline:
                 torch.cuda.synchronize()
             if dist.is_initialized():
                 dist.barrier()
-        
-        gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)] 
+
+        gen_video_samples = torch.cat(gen_video_list, dim=2)[:, :, :int(max_frames_num)]
         gen_video_samples = gen_video_samples.to(torch.float32)
         if max_frames_num > frame_num and sum(miss_lengths) > 0:
             # split video frames
             gen_video_samples = gen_video_samples[:, :, :-1*miss_lengths[0]]
-        
+
         if dist.is_initialized():
             dist.barrier()
 

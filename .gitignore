@@ -1,0 +1,6 @@
+*.mp4
+save_audio/
+weights/
+
+*.py[co]
+.vscode/

@@ -6,6 +6,9 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+    get_cfg_group,
 )
 from einops import rearrange
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
@@ -45,13 +48,12 @@ def rope_apply(x, grid_sizes, freqs):
 
         # precompute multipliers
         x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2)) # [L, N, C/2] # 极坐标
+             s, n, -1, 2)) # [L, N, C/2] # 极坐标
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1) # seq_lens, 1,  3 * dim / 2 (T H W)
+        ], dim=-1).reshape(seq_len, 1, -1) # seq_lens, 1,  3 * dim / 2 (T H W)
 
         # apply rotary embedding
         sp_size = get_sequence_parallel_world_size()
@@ -242,20 +244,22 @@ def usp_dit_forward_multitalk(
     t:              [B].
     context:        A list of text embeddings each with shape [L, C].
     """
-    
+
     assert clip_fea is not None and y is not None
     # params
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
 
-    if y is not None:
-        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-
     _, T, H, W = x[0].shape
     N_t = T // self.patch_size[0]
     N_h = H // self.patch_size[1]
     N_w = W // self.patch_size[2]
+
+    if y is not None:
+        x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+    x[0] = x[0].to(context[0].dtype)
+    t = t.to(context[0].dtype)
 
     # embeddings
     x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -265,8 +269,8 @@ def usp_dit_forward_multitalk(
     seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
     assert seq_lens.max() <= seq_len
     x = torch.cat([
-        torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
-        for u in x
+        torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                    dim=1) for u in x
     ])
 
     # time embeddings
@@ -290,22 +294,28 @@ def usp_dit_forward_multitalk(
 
     # get audio token
     audio_embedding = None
-    if self.add_audio_cond:
-        audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...] # [2, 1, 5, 12, 768]
-        latter_frame_audio_emb = audio_cond[:, 1:, ...] # [2, 80, 5, 12, 768]
-        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) # 2, 20, 4, 5, 12, 768
-        middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] # 2, 20, 1, 3, 12, 768
-        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 3, 12, 768
-        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] # 2, 20, 1, 3, 12, 768
-        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 3, 12, 768
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] # 2, 20, 2, 1, 12, 768
-        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 2, 12, 768
-        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) # [B, (T-1)//vae_scale, W-1+vae_scale, S, C_a] # 2, 20, 8, 12, 768
-        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) # [2, 1, 5, 12, 768] [2, 20, 8, 12, 768] --> 2, 21, 32, 768
-        audio_embedding = torch.concat(audio_embedding.split(1), dim=2)
+    audio_cond = audio.to(device=x.device, dtype=x.dtype)
+    first_frame_audio_emb_s = audio_cond[:, :1, ...] # [2, 1, 5, 12, 768]
+    latter_frame_audio_emb = audio_cond[:, 1:, ...] # [2, 80, 5, 12, 768]
+    latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) # 2, 20, 4, 5, 12, 768
+    middle_index = self.audio_window // 2
+    latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] # 2, 20, 1, 3, 12, 768
+    latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 3, 12, 768
+    latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] # 2, 20, 1, 3, 12, 768
+    latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 3, 12, 768
+    latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] # 2, 20, 2, 1, 12, 768
+    latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 2, 12, 768
+    latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) # [B, (T-1)//vae_scale, W-1+vae_scale, S, C_a] # 2, 20, 8, 12, 768
+    audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) # [2, 1, 5, 12, 768] [2, 20, 8, 12, 768] --> 2, 21, 32, 768
+    batch_size = audio_embedding.shape[0]
+    audio_embeddings = []
+    for i in range(batch_size):
+        audio_embeddings.append(
+                torch.concat(audio_embedding[[i]].split(1), dim=2).to(x.dtype)
+        )
+    audio_embedding = torch.cat(audio_embeddings, dim=0)
 
+    # audio_embedding = torch.concat(audio_embedding.split(1), dim=2)
 
     # convert ref_target_masks to token_ref_target_masks
     if ref_target_masks is not None:
@@ -315,6 +325,21 @@ def usp_dit_forward_multitalk(
         token_ref_target_masks = (token_ref_target_masks > 0)
         token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) # [B, N_h, N_w] --> [B, N_h * N_w]
         token_ref_target_masks = token_ref_target_masks.to(x.dtype)
+
+    ## CFG Parallel
+    # print("Grid Sizes: ", grid_sizes.shape)
+    grid_sizes = torch.chunk(
+        grid_sizes, get_classifier_free_guidance_world_size(), dim=0
+    )[get_classifier_free_guidance_rank()]
+    context = torch.chunk(
+        context, get_classifier_free_guidance_world_size(), dim=0
+    )[get_classifier_free_guidance_rank()]
+    audio_embedding = torch.chunk(
+        audio_embedding, get_classifier_free_guidance_world_size(), dim=0
+    )[get_classifier_free_guidance_rank()]
+    seq_lens = torch.chunk(
+        seq_lens, get_classifier_free_guidance_world_size(), dim=0
+    )[get_classifier_free_guidance_rank()]
 
     # arguments
     kwargs = dict(
@@ -328,10 +353,16 @@ def usp_dit_forward_multitalk(
         ref_target_masks=token_ref_target_masks
         )
 
+    # CFG Parallel
+    x = torch.chunk(
+        x, get_classifier_free_guidance_world_size(), dim=0
+    )[get_classifier_free_guidance_rank()]
+
+
     # Context Parallel
     x = torch.chunk(
-        x, get_sequence_parallel_world_size(),
-        dim=1)[get_sequence_parallel_rank()]
+        x, get_sequence_parallel_world_size(), dim=1
+    )[get_sequence_parallel_rank()]
 
     for block in self.blocks:
         x = block(x, **kwargs)
@@ -342,9 +373,19 @@ def usp_dit_forward_multitalk(
     # Context Parallel
     x = get_sp_group().all_gather(x, dim=1)
 
+    import torch.distributed as dist
+    is_rank_zero = dist.get_rank() == 0
+
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
-    return [u.float() for u in x]
+
+    # Then we need to stack before gathering
+    x = torch.stack(x, dim=0).float()
+
+    # CFG Parallel
+    x = get_cfg_group().all_gather(x, dim=0)
+
+    return x
 
 
 def usp_attn_forward_multitalk(self,
@@ -385,7 +426,7 @@ def usp_attn_forward_multitalk(self,
     x = self.o(x)
 
     with torch.no_grad():
-        x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
+        x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
                                             ref_target_masks=ref_target_masks, enable_sp=self.enable_sp) # B S(N_t N_h Nw)
 
     return x, x_ref_attn_map

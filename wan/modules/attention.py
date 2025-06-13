@@ -192,11 +192,11 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
 
     source_min, source_max = source_range
     new_min, new_max = target_range
- 
+
     normalized = (column - source_min) / (source_max - source_min + epsilon)
     scaled = normalized * (new_max - new_min) + new_min
     return scaled
-    
+
 
 class SingleStreamAttention(nn.Module):
     def __init__(
@@ -235,7 +235,7 @@ class SingleStreamAttention(nn.Module):
         self.add_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
     def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None) -> torch.Tensor:
-       
+
         N_t, _, _ = shape
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
 
@@ -247,12 +247,12 @@ class SingleStreamAttention(nn.Module):
 
         if self.qk_norm:
             q = self.q_norm(q)
-        
+
         # get kv from encoder_hidden_states
         _, N_a, _ = encoder_hidden_states.shape
         encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
         encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
@@ -263,12 +263,12 @@ class SingleStreamAttention(nn.Module):
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
         x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
-        x = rearrange(x, "B M H K -> B H M K") 
+        x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -313,32 +313,31 @@ class SingleStreamMutiAttention(SingleStreamAttention):
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
-    def forward(self, 
-                x: torch.Tensor, 
-                encoder_hidden_states: torch.Tensor, 
-                shape=None, 
+    def forward(self,
+                x: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+                shape=None,
                 x_ref_attn_map=None) -> torch.Tensor:
-        
+
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
         audio_num = encoder_hidden_states.shape[1] // 32
         if audio_num == 1:
             return super().forward(x, encoder_hidden_states, shape)
 
-        N_t, _, _ = shape 
-        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t) 
+        N_t, _, _ = shape
+        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
 
         # get q for hidden_state
         B, N, C = x.shape
-        q = self.q_linear(x) 
-        q_shape = (B, N, self.num_heads, self.head_dim) 
+        q = self.q_linear(x)
+        q_shape = (B, N, self.num_heads, self.head_dim)
         q = q.view(q_shape).permute((0, 2, 1, 3))
 
         if self.qk_norm:
             q = self.q_norm(q)
 
-  
-        max_values = x_ref_attn_map.max(1).values[:, None, None] 
-        min_values = x_ref_attn_map.min(1).values[:, None, None] 
+        max_values = x_ref_attn_map.max(1).values[:, None, None]
+        min_values = x_ref_attn_map.min(1).values[:, None, None]
         max_min_values = torch.cat([max_values, min_values], dim=2)
         if self.enable_sp:
             max_min_values = get_sp_group().all_gather(x, dim=max_min_values)
@@ -346,36 +345,42 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
         human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
 
-        human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
-        human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
-        back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
-        max_indices = x_ref_attn_map.argmax(dim=0)
+        human1 = normalize_and_scale(x_ref_attn_map[:, 0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
+        human2 = normalize_and_scale(x_ref_attn_map[:, 1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
+        back   = torch.full_like(human2, self.rope_bak)
+        max_indices = x_ref_attn_map.argmax(dim=1)
         normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N 
+
+        # Create batch and position indices
+        batch_size, _, L = normalized_map.shape
+        batch_idx = torch.arange(batch_size).unsqueeze(1).expand(batch_size, L)      # [N, L]
+        pos_idx   = torch.arange(L).unsqueeze(0).expand(batch_size, L)      # [N, L]
+        # Use advanced indexing to get normalized_map[n, max_indices[n, l], l]
+        normalized_pos = normalized_map[batch_idx, max_indices, pos_idx]  # [N, L]
 
         q = rearrange(q, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
         q = self.rope_1d(q, normalized_pos)
         q = rearrange(q, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
-        _, N_a, _ = encoder_hidden_states.shape 
-        encoder_kv = self.kv_linear(encoder_hidden_states) 
+        N_a = encoder_hidden_states.shape[-2]
+        encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
-        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4)) 
-        encoder_k, encoder_v = encoder_kv.unbind(0) 
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+        encoder_k, encoder_v = encoder_kv.unbind(0)
 
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
-        
+
         per_frame = torch.zeros(N_a, dtype=encoder_k.dtype).to(encoder_k.device)
         per_frame[:per_frame.size(0)//2] = (self.rope_h1[0] + self.rope_h1[1]) / 2
         per_frame[per_frame.size(0)//2:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
-        encoder_pos = torch.concat([per_frame]*N_t, dim=0)
+        encoder_pos = torch.stack([torch.concat([per_frame] * N_t, dim=0)] * batch_size, dim=0)
         encoder_k = rearrange(encoder_k, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
         encoder_k = rearrange(encoder_k, "B H (N_t S) C -> (B N_t) H S C", N_t=N_t)
 
- 
+
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
@@ -384,12 +389,12 @@ class SingleStreamMutiAttention(SingleStreamAttention):
 
         # linear transform
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) 
-        x = x.reshape(x_output_shape) 
-        x = self.proj(x) 
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
+        x = self.proj(x)
         x = self.proj_drop(x)
 
         # reshape x to origin shape
-        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t) 
+        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
 
         return x

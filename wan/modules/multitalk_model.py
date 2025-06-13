@@ -59,7 +59,7 @@ def rope_apply(x, grid_sizes, freqs):
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        dim=-1).reshape(seq_len, 1, -1)
 
 
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
@@ -96,9 +96,9 @@ class WanLayerNorm(nn.LayerNorm):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
         out = F.layer_norm(
-            inputs.float(), 
-            self.normalized_shape, 
-            None if self.weight is None else self.weight.float(), 
+            inputs.float(),
+            self.normalized_shape,
+            None if self.weight is None else self.weight.float(),
             None if self.bias is None else self.bias.float() ,
             self.eps
         ).to(origin_dtype)
@@ -147,7 +147,7 @@ class WanSelfAttention(nn.Module):
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
 
-        
+
         x = flash_attention(
             q=q,
             k=k,
@@ -160,7 +160,7 @@ class WanSelfAttention(nn.Module):
         x = x.flatten(2)
         x = self.o(x)
         with torch.no_grad():
-            x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
+            x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
                                                     ref_target_masks=ref_target_masks, enable_sp=self.enable_sp)
 
         return x, x_ref_attn_map
@@ -262,7 +262,7 @@ class WanAttentionBlock(nn.Module):
                 enable_sp=enable_sp,
             )
         self.norm_x = WanLayerNorm(dim, eps, elementwise_affine=True)  if norm_input_visual else nn.Identity()
-        
+
         self.enable_sp = enable_sp
 
     def forward(
@@ -291,7 +291,7 @@ class WanAttentionBlock(nn.Module):
             freqs, ref_target_masks=ref_target_masks)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
-        
+
         x = x.to(dtype)
 
         # cross-attention of text
@@ -362,8 +362,8 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         self,
         seq_len=5,
         seq_len_vf=12,
-        blocks=12,  
-        channels=768, 
+        blocks=12,
+        channels=768,
         intermediate_dim=512,
         output_dim=768,
         context_tokens=32,
@@ -374,7 +374,7 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         self.seq_len = seq_len
         self.blocks = blocks
         self.channels = channels
-        self.input_dim = seq_len * blocks * channels  
+        self.input_dim = seq_len * blocks * channels
         self.input_dim_vf = seq_len_vf * blocks * channels
         self.intermediate_dim = intermediate_dim
         self.context_tokens = context_tokens
@@ -402,11 +402,11 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         audio_embeds_vf = audio_embeds_vf.view(batch_size_vf, window_size_vf * blocks_vf * channels_vf)
 
         # first projection
-        audio_embeds = torch.relu(self.proj1(audio_embeds)) 
-        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf)) 
+        audio_embeds = torch.relu(self.proj1(audio_embeds))
+        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf))
         audio_embeds = rearrange(audio_embeds, "(bz f) c -> bz f c", bz=B)
         audio_embeds_vf = rearrange(audio_embeds_vf, "(bz f) c -> bz f c", bz=B)
-        audio_embeds_c = torch.concat([audio_embeds, audio_embeds_vf], dim=1) 
+        audio_embeds_c = torch.concat([audio_embeds, audio_embeds_vf], dim=1)
         batch_size_c, N_t, C_a = audio_embeds_c.shape
         audio_embeds_c = audio_embeds_c.view(batch_size_c*N_t, C_a)
 
@@ -458,7 +458,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
                  norm_input_visual=True,
                  norm_output_audio=True,
-                 
+
                  enable_sp=False):
         super().__init__()
 
@@ -485,7 +485,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.audio_window = audio_window
         self.intermediate_dim = intermediate_dim
         self.vae_scale = vae_scale
-        
+
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -502,7 +502,7 @@ class WanModel(ModelMixin, ConfigMixin):
         cross_attn_type = 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                              window_size, qk_norm, cross_attn_norm, eps, 
+                              window_size, qk_norm, cross_attn_norm, eps,
                               output_dim=output_dim, norm_input_visual=norm_input_visual,
                               enable_sp=enable_sp)
             for _ in range(num_layers)
@@ -524,7 +524,7 @@ class WanModel(ModelMixin, ConfigMixin):
             self.img_emb = MLPProj(1280, dim)
         else:
             raise NotImplementedError('Not supported model type.')
-        
+
         # init audio adapter
         self.audio_proj = AudioProjModel(
                     seq_len=audio_window,
@@ -549,7 +549,7 @@ class WanModel(ModelMixin, ConfigMixin):
         y=None,
         audio=None,
         ref_target_masks=None,
-    ):        
+    ):
         assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
@@ -596,33 +596,39 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # clip embedding
         if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea) 
+            context_clip = self.img_emb(clip_fea)
             context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
-        
+
         audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-        latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
+        first_frame_audio_emb_s = audio_cond[:, :1, ...]
+        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
         middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
-        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
+        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
+        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
+        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+        batch_size = audio_embedding.shape[0]
+        audio_embeddings = []
+        for i in range(batch_size):
+            audio_embeddings.append(
+                    torch.concat(audio_embedding[[i]].split(1), dim=2).to(x.dtype)
+            )
+        audio_embedding = torch.cat(audio_embeddings, dim=0)
 
 
         # convert ref_target_masks to token_ref_target_masks
         if ref_target_masks is not None:
-            ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) 
-            token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') 
+            ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32)
+            token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest')
             token_ref_target_masks = token_ref_target_masks.squeeze(0)
             token_ref_target_masks = (token_ref_target_masks > 0)
-            token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) 
+            token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
             token_ref_target_masks = token_ref_target_masks.to(x.dtype)
 
         # arguments
@@ -646,7 +652,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
 
-        return torch.stack(x).float()
+        return torch.cat(x, dim=0).float()
 
     def unpatchify(self, x, grid_sizes):
         r"""
