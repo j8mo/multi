@@ -244,8 +244,9 @@ class MultiTalkPipeline:
                 If True, offloads models to CPU during generation to save VRAM
         """
         input_prompt = input_data['prompt']
-        cond_file_path = input_data['cond_image']
-        cond_image = Image.open(cond_file_path).convert('RGB')
+        cond_image = input_data['cond_image']
+        if isinstance(cond_image, str):
+            cond_image = Image.open(cond_image).convert('RGB')
 
 
         # decide a proper size
@@ -267,22 +268,23 @@ class MultiTalkPipeline:
 
 
         # read audio embeddings
-        audio_embedding_path_1 = input_data['cond_audio']['person1']
+        audio_embedding_1 = input_data['cond_audio']['person1']
         if len(input_data['cond_audio']) == 1:
             HUMAN_NUMBER = 1
-            audio_embedding_path_2 = None
+            audio_embedding_2 = None
         else:
             HUMAN_NUMBER = 2
-            audio_embedding_path_2 = input_data['cond_audio']['person2']
+            audio_embedding_2 = input_data['cond_audio']['person2']
 
 
         full_audio_embs = []
-        audio_embedding_paths = [audio_embedding_path_1, audio_embedding_path_2]
+        audio_embeddings = [audio_embedding_1, audio_embedding_2]
         for human_idx in range(HUMAN_NUMBER):
-            audio_embedding_path = audio_embedding_paths[human_idx]
-            if not os.path.exists(audio_embedding_path):
-                continue
-            full_audio_emb = torch.load(audio_embedding_path)
+            full_audio_emb = audio_embeddings[human_idx]
+            if isinstance(full_audio_emb, str):
+                if not os.path.exists(full_audio_emb):
+                    continue
+                full_audio_emb = torch.load(full_audio_emb)
             if torch.isnan(full_audio_emb).any():
                 continue
             if full_audio_emb.shape[0] <= frame_num:

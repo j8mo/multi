@@ -149,7 +149,7 @@ def _parse_args():
     parser.add_argument(
         "--input_json",
         type=str,
-        default='examples/single_example_1.json',
+        default='examples/multitalk_example_1.json',
         help="[meta file] The condition path to generate the video.")
     parser.add_argument(
         "--motion_frame",
@@ -404,7 +404,7 @@ def generate(args):
         args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
         os.makedirs(args.audio_save_dir,exist_ok=True)
 
-        if len(input_data['cond_audio'])==2:
+        if len(input_data['cond_audio']) == 2:
             new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
             audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
             audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
@@ -417,7 +417,7 @@ def generate(args):
             input_data['cond_audio']['person1'] = emb1_path
             input_data['cond_audio']['person2'] = emb2_path
             input_data['video_audio'] = sum_audio
-        elif len(input_data['cond_audio'])==1:
+        elif len(input_data['cond_audio']) == 1:
             human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
             audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
             emb_path = os.path.join(args.audio_save_dir, '1.pt')
@@ -473,6 +473,7 @@ def generate(args):
         save_video_ffmpeg(video, args.save_file, [input_data['video_audio']])
 
     logging.info("Finished.")
+
 
 
 if __name__ == "__main__":
