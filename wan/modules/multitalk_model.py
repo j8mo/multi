@@ -627,26 +627,28 @@ class WanModel(ModelMixin, ConfigMixin):
             context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
 
-        audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...]
-        latter_frame_audio_emb = audio_cond[:, 1:, ...]
-        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
-        middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
-        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
-        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
-        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
-        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
-        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
-        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
-        human_num = len(audio_embedding) // batch_size## I think this is not correct, it should be len(audio_embedding[0]) i think, need to test
-        audio_embeddings = []
-        for i in range(batch_size):
-            audio_embeddings.append(
-                    torch.concat(audio_embedding[[i]].split(1), dim=2).to(x.dtype)
-            )
-        audio_embedding = torch.cat(audio_embeddings, dim=0)
+        audio_conds = audio.to(device=x.device, dtype=x.dtype)
+        audio_embedding = []
+        if not isinstance(audio_conds, list):
+            audio_conds = [audio_conds]
+        for audio_cond in audio_conds:
+            first_frame_audio_emb_s = audio_cond[:, :1, ...]
+            latter_frame_audio_emb = audio_cond[:, 1:, ...]
+            latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
+            middle_index = self.audio_window // 2
+            latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
+            latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+            latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+            latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+            latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
+            latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+            latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+            audio_embed = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+            human_num = len(audio_embed)
+            audio_embed = torch.concat(audio_embed.split(1), dim=2).to(x.dtype)
+            audio_embedding.append(audio_embed)
+
+        audio_embedding = torch.cat(audio_embedding, dim=0).to(x.dtype)
 
 
         # convert ref_target_masks to token_ref_target_masks

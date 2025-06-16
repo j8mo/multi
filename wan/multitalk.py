@@ -589,11 +589,11 @@ class MultiTalkPipeline:
                         'clip_fea': torch.cat([clip_context] * cfg_size, dim=0),
                         'seq_len': max_seq_len,
                         'y': torch.cat([y] * cfg_size, dim=0),
-                        'audio': torch.cat([
+                        'audio': [
                             audio_embs,
                             audio_embs,
                             torch.zeros_like(audio_embs)[-1:]
-                        ], dim=0),
+                        ],
                         'ref_target_masks': ref_target_masks
                     }
 
