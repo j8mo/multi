@@ -183,6 +183,44 @@ def _parse_args():
         type=float,
         default=4.0,
         help="Classifier free guidance scale for audio control.")
+    parser.add_argument(
+        "--num_persistent_param_in_dit",
+        type=int,
+        default=None,
+        required=False,
+        help="Maximum parameter quantity retained in video memory, small number to reduce VRAM required",
+    )
+    parser.add_argument(
+        "--use_teacache",
+        action="store_true",
+        default=False,
+        help="Enable teacache for video generation."
+    )
+    parser.add_argument(
+        "--teacache_thresh",
+        type=float,
+        default=0.2,
+        help="Threshold for teacache."
+    )
+    parser.add_argument(
+        "--use_apg",
+        action="store_true",
+        default=False,
+        help="Enable adaptive projected guidance for video generation (APG)."
+    )
+    parser.add_argument(
+        "--apg_momentum",
+        type=float,
+        default=-0.75,
+        help="Momentum used in adaptive projected guidance (APG)."
+    )
+    parser.add_argument(
+        "--apg_norm_threshold",
+        type=float,
+        default=55,
+        help="Norm threshold used in adaptive projected guidance (APG)."
+    )
+
 
     args = parser.parse_args()
 
@@ -444,6 +482,12 @@ def generate(args):
             wan_i2v.model,
         )
 
+    if args.num_persistent_param_in_dit is not None:
+        wan_i2v.vram_management = True
+        wan_i2v.enable_vram_management(
+            num_persistent_param_in_dit=args.num_persistent_param_in_dit
+        )
+
     logging.info("Generating video ...")
     video = wan_i2v.generate(
         input_data,
@@ -458,6 +502,7 @@ def generate(args):
         offload_model=args.offload_model,
         max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
         batched_cfg=args.batched_cfg,
+        extra_args=args,
     )
 
 

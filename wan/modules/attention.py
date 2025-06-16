@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from ..utils.multitalk_utils import RotaryPositionalEmbedding1D
+from ..utils.multitalk_utils import RotaryPositionalEmbedding1D, normalize_and_scale, split_token_counts_and_frame_ids
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -187,17 +187,6 @@ def attention(
         out = out.transpose(1, 2).contiguous()
         return out
 
-
-def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
-
-    source_min, source_max = source_range
-    new_min, new_max = target_range
-
-    normalized = (column - source_min) / (source_max - source_min + epsilon)
-    scaled = normalized * (new_max - new_min) + new_min
-    return scaled
-
-
 class SingleStreamAttention(nn.Module):
     def __init__(
         self,
@@ -234,10 +223,11 @@ class SingleStreamAttention(nn.Module):
         self.add_q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.add_k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
-    def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, encoder_hidden_states: torch.Tensor, shape=None, enable_sp=False, kv_seq=None) -> torch.Tensor:
 
-        N_t, _, _ = shape
-        x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
+        N_t, N_h, N_w = shape
+        if not enable_sp:
+            x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
 
         # get q for hidden_state
         B, N, C = x.shape
@@ -262,7 +252,17 @@ class SingleStreamAttention(nn.Module):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
+
+        if enable_sp:
+            # context parallel
+            sp_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
+            visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
+            assert kv_seq is not None, f"kv_seq should not be None."
+            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
+        else:
+            attn_bias = None
+        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
@@ -272,8 +272,9 @@ class SingleStreamAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        # reshape x to origin shape
-        x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
+        if not enable_sp:
+            # reshape x to origin shape
+            x = rearrange(x, "(B N_t) S C -> B (N_t S) C", N_t=N_t)
 
         return x
 
@@ -289,7 +290,6 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         eps: float = 1e-6,
-        enable_sp: bool = False,
         class_range: int = 24,
         class_interval: int = 4,
     ) -> None:
@@ -304,7 +304,6 @@ class SingleStreamMutiAttention(SingleStreamAttention):
             proj_drop=proj_drop,
             eps=eps,
         )
-        self.enable_sp = enable_sp
         self.class_interval = class_interval
         self.class_range = class_range
         self.rope_h1  = (0, self.class_interval)
@@ -317,11 +316,11 @@ class SingleStreamMutiAttention(SingleStreamAttention):
                 x: torch.Tensor,
                 encoder_hidden_states: torch.Tensor,
                 shape=None,
-                x_ref_attn_map=None) -> torch.Tensor:
+                x_ref_attn_map=None,
+                human_num=None) -> torch.Tensor:
 
         encoder_hidden_states = encoder_hidden_states.squeeze(0)
-        audio_num = encoder_hidden_states.shape[1] // 32
-        if audio_num == 1:
+        if human_num == 1:
             return super().forward(x, encoder_hidden_states, shape)
 
         N_t, _, _ = shape
@@ -339,8 +338,6 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         max_values = x_ref_attn_map.max(1).values[:, None, None]
         min_values = x_ref_attn_map.min(1).values[:, None, None]
         max_min_values = torch.cat([max_values, min_values], dim=2)
-        if self.enable_sp:
-            max_min_values = get_sp_group().all_gather(x, dim=max_min_values)
 
         human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
         human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()

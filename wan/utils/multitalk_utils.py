@@ -43,6 +43,36 @@ def torch_gc():
 
 
 
+def split_token_counts_and_frame_ids(T, token_frame, world_size, rank):
+
+    S = T * token_frame
+    split_sizes = [S // world_size + (1 if i < S % world_size else 0) for i in range(world_size)]
+    start = sum(split_sizes[:rank])
+    end = start + split_sizes[rank]
+    counts = [0] * T
+    for idx in range(start, end):
+        t = idx // token_frame
+        counts[t] += 1
+
+    counts_filtered = []
+    frame_ids = []
+    for t, c in enumerate(counts):
+        if c > 0:
+            counts_filtered.append(c)
+            frame_ids.append(t)
+    return counts_filtered, frame_ids
+
+
+def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
+
+    source_min, source_max = source_range
+    new_min, new_max = target_range
+
+    normalized = (column - source_min) / (source_max - source_min + epsilon)
+    scaled = normalized * (new_max - new_min) + new_min
+    return scaled
+
+
 @torch.compile
 def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
 
@@ -66,23 +96,23 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', att
     for class_idx, ref_target_mask in enumerate(ref_target_masks):
         torch_gc()
         ref_target_mask = ref_target_mask[None, None, None, ...]
-        x_ref_attn_map = x_ref_attn_map_source.clone()
-        x_ref_attn_map = x_ref_attn_map * ref_target_mask
-        x_ref_attn_map = x_ref_attn_map.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
-        x_ref_attn_map = x_ref_attn_map.permute(0, 2, 1) # B, x_seqlens, H
+        x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
+        x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
+        x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
 
         if mode == 'mean':
-            x_ref_attn_map = x_ref_attn_map.mean(-1) # B, x_seqlens
+            x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
         elif mode == 'max':
-            x_ref_attn_map = x_ref_attn_map.max(-1) # B, x_seqlens
+            x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
 
-        x_ref_attn_maps.append(x_ref_attn_map)
+        x_ref_attn_maps.append(x_ref_attnmap)
 
     del attn
     del x_ref_attn_map_source
     torch_gc()
 
     return torch.stack([x_ref_attn_map for x_ref_attn_map in x_ref_attn_maps], dim=1) # B, class_num, x_seqlens
+
 
 def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
     """Args:
@@ -98,8 +128,7 @@ def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, spli
         ref_k = get_sp_group().all_gather(ref_k, dim=1)
 
     x_seqlens = N_h * N_w
-    # visual_q  = query # 1, 3024, 12, 128
-    ref_k     = ref_k[:, :x_seqlens] # 1, 144, 12, 128
+    ref_k     = ref_k[:, :x_seqlens]
     _, seq_lens, heads, _ = visual_q.shape
     class_num, _ = ref_target_masks.shape
     x_ref_attn_maps = torch.zeros(batch_size, class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
@@ -174,7 +203,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
 
     video_audio = (gen_video_samples+1)/2 # C T H W
     video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
-    video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)  # to [0, 255]
+    video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)
     save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
 
 
@@ -214,3 +243,46 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
     os.remove(save_path_crop_audio)
 
 
+
+class MomentumBuffer:
+    def __init__(self, momentum: float):
+        self.momentum = momentum
+        self.running_average = 0
+
+    def update(self, update_value: torch.Tensor):
+        new_average = self.momentum * self.running_average
+        self.running_average = update_value + new_average
+
+
+
+def project(
+        v0: torch.Tensor, # [B, C, T, H, W]
+        v1: torch.Tensor, # [B, C, T, H, W]
+        ):
+    dtype = v0.dtype
+    v0, v1 = v0.double(), v1.double()
+    v1 = torch.nn.functional.normalize(v1, dim=[-1, -2, -3, -4])
+    v0_parallel = (v0 * v1).sum(dim=[-1, -2, -3, -4], keepdim=True) * v1
+    v0_orthogonal = v0 - v0_parallel
+    return v0_parallel.to(dtype), v0_orthogonal.to(dtype)
+
+
+def adaptive_projected_guidance(
+          diff: torch.Tensor, # [B, C, T, H, W]
+          pred_cond: torch.Tensor, # [B, C, T, H, W]
+          momentum_buffer: MomentumBuffer = None,
+          eta: float = 0.0,
+          norm_threshold: float = 55,
+          ):
+    if momentum_buffer is not None:
+        momentum_buffer.update(diff)
+        diff = momentum_buffer.running_average
+    if norm_threshold > 0:
+        ones = torch.ones_like(diff)
+        diff_norm = diff.norm(p=2, dim=[-1, -2, -3, -4], keepdim=True)
+        print(f"diff_norm: {diff_norm}")
+        scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
+        diff = diff * scale_factor
+    diff_parallel, diff_orthogonal = project(diff, pred_cond)
+    normalized_update = diff_orthogonal + eta * diff_parallel
+    return normalized_update

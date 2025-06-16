@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp
@@ -12,9 +13,11 @@ from xfuser.core.distributed import (
 )
 from einops import rearrange
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+import xformers.ops
 
 from ..modules.model import sinusoidal_embedding_1d
-from ..utils.multitalk_utils import get_attn_map_with_target
+from ..utils.multitalk_utils import get_attn_map_with_target, split_token_counts_and_frame_ids, normalize_and_scale
+from ..modules.attention import SingleStreamAttention, SingleStreamMutiAttention
 
 
 def pad_freqs(original_tensor, target_len):
@@ -251,6 +254,7 @@ def usp_dit_forward_multitalk(
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
 
+    bs = x.shape[0]
     _, T, H, W = x[0].shape
     N_t = T // self.patch_size[0]
     N_h = H // self.patch_size[1]
@@ -289,7 +293,7 @@ def usp_dit_forward_multitalk(
         ]))
 
     if clip_fea is not None:
-        context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+        context_clip = self.img_emb(clip_fea)
         context = torch.concat([context_clip, context], dim=1)
 
     # get audio token
@@ -307,6 +311,7 @@ def usp_dit_forward_multitalk(
     latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 2, 12, 768
     latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) # [B, (T-1)//vae_scale, W-1+vae_scale, S, C_a] # 2, 20, 8, 12, 768
     audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) # [2, 1, 5, 12, 768] [2, 20, 8, 12, 768] --> 2, 21, 32, 768
+    human_num = len(audio_embedding)
     batch_size = audio_embedding.shape[0]
     audio_embeddings = []
     for i in range(batch_size):
@@ -315,16 +320,79 @@ def usp_dit_forward_multitalk(
         )
     audio_embedding = torch.cat(audio_embeddings, dim=0)
 
-    # audio_embedding = torch.concat(audio_embedding.split(1), dim=2)
 
     # convert ref_target_masks to token_ref_target_masks
     if ref_target_masks is not None:
-        ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) # [1, B, H, W]; cast for interpolation
-        token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') # [1, B, N_h, N_w]
-        token_ref_target_masks = token_ref_target_masks.squeeze(0) # [B, N_h, N_w]
+        ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32)
+        token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest')
+        token_ref_target_masks = token_ref_target_masks.squeeze(0)
         token_ref_target_masks = (token_ref_target_masks > 0)
-        token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) # [B, N_h, N_w] --> [B, N_h * N_w]
+        token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
         token_ref_target_masks = token_ref_target_masks.to(x.dtype)
+
+    if self.enable_teacache:
+        modulated_inp = e0 if self.use_ret_steps else e
+        if bs == 3:
+            if self.cnt%3==0: # cond
+                if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                    should_calc_cond = True
+                    self.accumulated_rel_l1_distance_cond = 0
+                else:
+                    rescale_func = np.poly1d(self.coefficients)
+                    self.accumulated_rel_l1_distance_cond += rescale_func(((modulated_inp-self.previous_e0_cond).abs().mean() / self.previous_e0_cond.abs().mean()).cpu().item())
+                    # print("accumulated_rel_l1_distance_even", self.accumulated_rel_l1_distance_even)
+                    if self.accumulated_rel_l1_distance_cond < self.teacache_thresh:
+                        should_calc_cond = False
+                    else:
+                        should_calc_cond = True
+                        self.accumulated_rel_l1_distance_cond = 0
+                self.previous_e0_cond = modulated_inp.clone()
+            elif self.cnt%3==1: # drop_text
+                if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                    should_calc_drop_text = True
+                    self.accumulated_rel_l1_distance_drop_text = 0
+                else:
+                    rescale_func = np.poly1d(self.coefficients)
+                    self.accumulated_rel_l1_distance_drop_text += rescale_func(((modulated_inp-self.previous_e0_drop_text).abs().mean() / self.previous_e0_drop_text.abs().mean()).cpu().item())
+                    if self.accumulated_rel_l1_distance_drop_text < self.teacache_thresh:
+                        should_calc_drop_text = False
+                    else:
+                        should_calc_drop_text = True
+                        self.accumulated_rel_l1_distance_drop_text = 0
+                self.previous_e0_drop_text = modulated_inp.clone()
+            else: # uncond
+                if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                    should_calc_uncond = True
+                    self.accumulated_rel_l1_distance_uncond = 0
+                else:
+                    rescale_func = np.poly1d(self.coefficients)
+                    self.accumulated_rel_l1_distance_uncond += rescale_func(((modulated_inp-self.previous_e0_uncond).abs().mean() / self.previous_e0_uncond.abs().mean()).cpu().item())
+                    if self.accumulated_rel_l1_distance_uncond < self.teacache_thresh:
+                        should_calc_uncond = False
+                    else:
+                        should_calc_uncond = True
+                        self.accumulated_rel_l1_distance_uncond = 0
+                self.previous_e0_uncond = modulated_inp.clone()
+        elif bs == 1:
+            if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                should_calc_cond = True
+                self.accumulated_rel_l1_distance_cond = 0
+            else:
+                rescale_func = np.poly1d(self.coefficients)
+                self.accumulated_rel_l1_distance_cond += rescale_func(((modulated_inp-self.previous_e0_cond).abs().mean() / self.previous_e0_cond.abs().mean()).cpu().item())
+                if self.accumulated_rel_l1_distance_cond < self.teacache_thresh:
+                    should_calc_cond = False
+                else:
+                    should_calc_cond = True
+                    self.accumulated_rel_l1_distance_cond = 0
+            self.previous_e0_cond = modulated_inp.clone()
+        else:
+            raise ValueError(f"Unsupported batch size {bs} for teacache.")
+
+    # Context Parallel
+    x = torch.chunk(
+        x, get_sequence_parallel_world_size(),
+        dim=1)[get_sequence_parallel_rank()]
 
     ## CFG Parallel
     # print("Grid Sizes: ", grid_sizes.shape)
@@ -350,7 +418,8 @@ def usp_dit_forward_multitalk(
         context=context,
         context_lens=context_lens,
         audio_embedding=audio_embedding,
-        ref_target_masks=token_ref_target_masks
+        ref_target_masks=token_ref_target_masks,
+        human_num=human_num,
         )
 
     # CFG Parallel
@@ -364,17 +433,49 @@ def usp_dit_forward_multitalk(
         x, get_sequence_parallel_world_size(), dim=1
     )[get_sequence_parallel_rank()]
 
-    for block in self.blocks:
-        x = block(x, **kwargs)
+    if self.enable_teacache:
+        if bs == 3:
+            if self.cnt%3==0:
+                if not should_calc_cond:
+                    x +=  self.previous_residual_cond
+                else:
+                    ori_x = x.clone()
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    self.previous_residual_cond = x - ori_x
+            elif self.cnt%3==1:
+                if not should_calc_drop_text:
+                    x +=  self.previous_residual_drop_text
+                else:
+                    ori_x = x.clone()
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    self.previous_residual_drop_text = x - ori_x
+            else:
+                if not should_calc_uncond:
+                    x +=  self.previous_residual_uncond
+                else:
+                    ori_x = x.clone()
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    self.previous_residual_uncond = x - ori_x
+        elif bs == 1:
+            if not should_calc_cond:
+                x +=  self.previous_residual_cond
+            else:
+                ori_x = x.clone()
+                for block in self.blocks:
+                    x = block(x, **kwargs)
+                self.previous_residual_cond = x - ori_x
+    else:
+        for block in self.blocks:
+            x = block(x, **kwargs)
 
     # head
     x = self.head(x, e)
 
     # Context Parallel
     x = get_sp_group().all_gather(x, dim=1)
-
-    import torch.distributed as dist
-    is_rank_zero = dist.get_rank() == 0
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -384,6 +485,11 @@ def usp_dit_forward_multitalk(
 
     # CFG Parallel
     x = get_cfg_group().all_gather(x, dim=0)
+
+    if self.enable_teacache:
+        self.cnt += 1
+        if self.cnt >= self.num_steps:
+            self.cnt = 0
 
     return x
 
@@ -430,3 +536,84 @@ def usp_attn_forward_multitalk(self,
                                             ref_target_masks=ref_target_masks, enable_sp=self.enable_sp) # B S(N_t N_h Nw)
 
     return x, x_ref_attn_map
+
+
+
+
+def usp_crossattn_multi_forward_multitalk(self,
+                                        x: torch.Tensor,
+                                        encoder_hidden_states: torch.Tensor,  # 1, 21, 64, C
+                                        shape=None,
+                                        x_ref_attn_map=None,
+                                        human_num=None) -> torch.Tensor:
+
+        N_t, N_h, N_w = shape
+        sp_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_rank()
+        audio_tokens_per_frame = 32
+        visual_seqlen, frame_ids = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
+        encoder_hidden_states = encoder_hidden_states[:, min(frame_ids):max(frame_ids)+1, ...]
+        encoder_hidden_states = rearrange(encoder_hidden_states, "B T N C -> B (T N) C")
+        N_a = len(frame_ids)
+        kv_seq = [audio_tokens_per_frame * human_num] * N_a
+
+        if human_num == 1:
+            return super(SingleStreamMutiAttention, self).forward(x, encoder_hidden_states, shape, enable_sp=True, kv_seq=kv_seq)
+
+
+        # get q for hidden_state
+        B, N, C = x.shape
+        q = self.q_linear(x)
+        q_shape = (B, N, self.num_heads, self.head_dim)
+        q = q.view(q_shape).permute((0, 2, 1, 3))
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+
+        max_values = x_ref_attn_map.max(1).values[:, None, None]
+        min_values = x_ref_attn_map.min(1).values[:, None, None]
+        max_min_values = torch.cat([max_values, min_values], dim=2)
+        max_min_values = get_sp_group().all_gather(max_min_values, dim=1)
+
+        human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
+        human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
+
+        human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
+        human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
+        back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
+        max_indices = x_ref_attn_map.argmax(dim=0)
+        normalized_map = torch.stack([human1, human2, back], dim=1)
+        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N
+        q = self.rope_1d(q, normalized_pos)
+
+        encoder_kv = self.kv_linear(encoder_hidden_states)
+        encoder_kv_shape = (B, encoder_hidden_states.size(1), 2, self.num_heads, self.head_dim)
+        encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
+        encoder_k, encoder_v = encoder_kv.unbind(0) # B H N C
+
+        if self.qk_norm:
+            encoder_k = self.add_k_norm(encoder_k)
+
+        # position embedding for condition audio embeddings
+        per_frame = torch.zeros(audio_tokens_per_frame * human_num, dtype=encoder_k.dtype).to(encoder_k.device)
+        per_frame[:audio_tokens_per_frame] = (self.rope_h1[0] + self.rope_h1[1]) / 2
+        per_frame[audio_tokens_per_frame:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
+        encoder_pos = torch.concat([per_frame]*N_a, dim=0)
+        encoder_k = self.rope_1d(encoder_k, encoder_pos)
+
+        # get attn
+        q = rearrange(q, "B H M K -> B M H K")
+        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
+        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+        attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
+        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
+        x = rearrange(x, "B M H K -> B H M K")
+
+        # linear transform
+        x_output_shape = (B, N, C)
+        x = x.transpose(1, 2)
+        x = x.reshape(x_output_shape)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x

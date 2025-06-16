@@ -22,9 +22,11 @@ from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
 from .modules.clip import CLIPModel
-from .modules.multitalk_model import WanModel
-from .modules.t5 import T5EncoderModel
-from .modules.vae import WanVAE
+from .modules.multitalk_model import WanModel, WanLayerNorm, WanRMSNorm
+from .modules.t5 import T5EncoderModel, T5LayerNorm, T5RelativeEmbedding
+from .modules.vae import WanVAE, CausalConv3d, RMS_norm, Upsample
+from .utils.multitalk_utils import MomentumBuffer, adaptive_projected_guidance
+from src.vram_management import AutoWrappedLinear, AutoWrappedModule, enable_vram_management
 
 
 def torch_gc():
@@ -100,7 +102,7 @@ class MultiTalkPipeline:
         t5_cpu=False,
         init_on_cpu=True,
         num_timesteps=1000,
-        use_timestep_transform=True,
+        use_timestep_transform=True
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -170,15 +172,19 @@ class MultiTalkPipeline:
             from .distributed.xdit_context_parallel import (
                 usp_dit_forward_multitalk,
                 usp_attn_forward_multitalk,
+                usp_crossattn_multi_forward_multitalk
             )
             for block in self.model.blocks:
                 block.self_attn.forward = types.MethodType(
                     usp_attn_forward_multitalk, block.self_attn)
+                block.audio_cross_attn.forward = types.MethodType(
+                    usp_crossattn_multi_forward_multitalk, block.audio_cross_attn)
             self.model.forward = types.MethodType(usp_dit_forward_multitalk, self.model)
             self.sp_size = get_sequence_parallel_world_size()
-            self.model.enable_sp = True
         else:
             self.sp_size = 1
+
+        self.model.to(self.param_dtype)
 
         if dist.is_initialized():
             dist.barrier()
@@ -193,6 +199,9 @@ class MultiTalkPipeline:
         self.num_timesteps = num_timesteps
         self.use_timestep_transform = use_timestep_transform
 
+        self.cpu_offload = False
+        self.model_names = ["model"]
+        self.vram_management = False
 
     def add_noise(
         self,
@@ -208,6 +217,79 @@ class MultiTalkPipeline:
 
         return (1 - timesteps) * original_samples + timesteps * noise
 
+    def enable_vram_management(self, num_persistent_param_in_dit=None):
+        dtype = next(iter(self.model.parameters())).dtype
+        enable_vram_management(
+            self.model,
+            module_map={
+                torch.nn.Linear: AutoWrappedLinear,
+                torch.nn.Conv3d: AutoWrappedModule,
+                torch.nn.LayerNorm: AutoWrappedModule,
+                WanLayerNorm: AutoWrappedModule,
+                WanRMSNorm: AutoWrappedModule,
+            },
+            module_config=dict(
+                offload_dtype=dtype,
+                offload_device="cpu",
+                onload_dtype=dtype,
+                onload_device=self.device,
+                computation_dtype=self.param_dtype,
+                computation_device=self.device,
+            ),
+            max_num_param=num_persistent_param_in_dit,
+            overflow_module_config=dict(
+                offload_dtype=dtype,
+                offload_device="cpu",
+                onload_dtype=dtype,
+                onload_device="cpu",
+                computation_dtype=self.param_dtype,
+                computation_device=self.device,
+            ),
+        )
+        self.enable_cpu_offload()
+
+    def enable_cpu_offload(self):
+        self.cpu_offload = True
+
+    def load_models_to_device(self, loadmodel_names=[]):
+        # only load models to device if cpu_offload is enabled
+        if not self.cpu_offload:
+            return
+        # offload the unneeded models to cpu
+        for model_name in self.model_names:
+            if model_name not in loadmodel_names:
+                model = getattr(self, model_name)
+
+                if not isinstance(model, nn.Module):
+                    model = model.model
+
+                if model is not None:
+                    if (
+                        hasattr(model, "vram_management_enabled")
+                        and model.vram_management_enabled
+                    ):
+                        for module in model.modules():
+                            if hasattr(module, "offload"):
+                                module.offload()
+                    else:
+                        model.cpu()
+        # load the needed models to device
+        for model_name in loadmodel_names:
+            model = getattr(self, model_name)
+            if not isinstance(model, nn.Module):
+                model = model.model
+            if model is not None:
+                if (
+                    hasattr(model, "vram_management_enabled")
+                    and model.vram_management_enabled
+                ):
+                    for module in model.modules():
+                        if hasattr(module, "onload"):
+                            module.onload()
+                else:
+                    model.to(self.device)
+        # fresh the cuda cache
+        torch.cuda.empty_cache()
 
     def generate(self,
                  input_data,
@@ -224,7 +306,9 @@ class MultiTalkPipeline:
                  max_frames_num=1000,
                  face_scale=0.05,
                  progress=True,
-                 batched_cfg=False):
+                 batched_cfg=False,
+                 extra_args=None
+    ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -243,6 +327,17 @@ class MultiTalkPipeline:
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
         """
+
+        # init teacache
+        if extra_args.use_teacache:
+            self.model.teacache_init(
+                sample_steps=sampling_steps,
+                teacache_thresh=extra_args.teacache_thresh,
+                model_scale=extra_args.size,
+            )
+        else:
+            self.model.disable_teacache()
+
         input_prompt = input_data['prompt']
         cond_image = input_data['cond_image']
         if isinstance(cond_image, str):
@@ -307,7 +402,7 @@ class MultiTalkPipeline:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-
+        torch_gc()
         # prepare params for video generation
         indices = (torch.arange(2 * 2 + 1) - 2) * 1
         clip_length = frame_num
@@ -373,10 +468,10 @@ class MultiTalkPipeline:
             with torch.no_grad():
                 # get clip embedding
                 self.clip.model.to(self.device)
-                clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype) # B C 1 H W --> B 257 1280
+                clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype)
                 if offload_model:
                     self.clip.model.cpu()
-                    torch_gc()
+                torch_gc()
 
                 # zero padding and vae encode
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
@@ -386,7 +481,7 @@ class MultiTalkPipeline:
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
                 latent_motion_frames = y[:, :, :cur_motion_frames_latent_num][0] # C T H W
                 y = torch.concat([msk, y], dim=1) # B 4+C T H W
-                if offload_model: torch_gc()
+                torch_gc()
 
 
             # construct human mask
@@ -432,7 +527,7 @@ class MultiTalkPipeline:
             ref_target_masks = (ref_target_masks > 0)
             ref_target_masks = ref_target_masks.float().to(self.device)
 
-            if offload_model: torch_gc()
+            torch_gc()
 
             @contextmanager
             def noop_no_sync():
@@ -505,6 +600,12 @@ class MultiTalkPipeline:
                 if offload_model: torch_gc()
                 self.model.to(self.device)
 
+                torch_gc()
+                if not self.vram_management:
+                    self.model.to(self.device)
+                else:
+                    self.load_models_to_device(["model"])
+
                 # injecting motion frames
                 if not is_first_clip:
                     latent_motion_frames = latent_motion_frames.to(latent.dtype).to(self.device)
@@ -512,6 +613,12 @@ class MultiTalkPipeline:
                     add_latent = self.add_noise(latent_motion_frames, motion_add_noise, timesteps[0])
                     _, T_m, _, _ = add_latent.shape
                     latent[:, :T_m] = add_latent
+
+                # infer with APG
+                # refer https://arxiv.org/abs/2410.02416
+                if extra_args.use_apg:
+                    text_momentumbuffer  = MomentumBuffer(extra_args.apg_momentum)
+                    audio_momentumbuffer = MomentumBuffer(extra_args.apg_momentum)
 
 
                 progress_wrap = partial(tqdm, total=len(timesteps)-1) if progress else (lambda x: x)
@@ -539,8 +646,24 @@ class MultiTalkPipeline:
                         noise_pred_uncond = self.model( latent_model_input, t=timestep, **arg_null)[0]
                         if offload_model: torch_gc()
 
-                    noise_pred = noise_pred_uncond + text_guide_scale * ( noise_pred_cond - noise_pred_drop_text) + audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
 
+                    if extra_args.use_apg:
+                        # correct update direction
+                        diff_uncond_text  = noise_pred_cond - noise_pred_drop_text
+                        diff_uncond_audio = noise_pred_drop_text - noise_pred_uncond
+                        noise_pred = noise_pred_cond + (text_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_text,
+                                                                                                            noise_pred_cond,
+                                                                                                            momentum_buffer=text_momentumbuffer,
+                                                                                                            norm_threshold=extra_args.apg_norm_threshold) \
+                               + (audio_guide_scale - 1) * adaptive_projected_guidance(diff_uncond_audio,
+                                                                                        noise_pred_cond,
+                                                                                        momentum_buffer=audio_momentumbuffer,
+                                                                                        norm_threshold=extra_args.apg_norm_threshold)
+                    else:
+                        # vanilla CFG strategy
+                        noise_pred = noise_pred_uncond + text_guide_scale * (
+                            noise_pred_cond - noise_pred_drop_text) + \
+                            audio_guide_scale * (noise_pred_drop_text - noise_pred_uncond)
                     noise_pred = -noise_pred
 
                     # update latent
@@ -556,12 +679,13 @@ class MultiTalkPipeline:
                         _, T_m, _, _ = add_latent.shape
                         latent[:, :T_m] = add_latent
 
-                    x0 = [latent.to(self.device)] # [(C T H W)]
+                    x0 = [latent.to(self.device)]
                     del latent_model_input, timestep
 
                 if offload_model:
-                    self.model.cpu()
-                    torch_gc()
+                    if not self.vram_management:
+                        self.model.cpu()
+                torch_gc()
 
                 videos = self.vae.decode(x0)
 
@@ -601,8 +725,8 @@ class MultiTalkPipeline:
 
             if max_frames_num <= frame_num: break
 
+            torch_gc()
             if offload_model:
-                torch_gc()
                 torch.cuda.synchronize()
             if dist.is_initialized():
                 dist.barrier()
@@ -617,6 +741,6 @@ class MultiTalkPipeline:
             dist.barrier()
 
         del noise, latent
-        if offload_model: torch_gc()
+        torch_gc()
 
         return gen_video_samples[0] if self.rank == 0 else None

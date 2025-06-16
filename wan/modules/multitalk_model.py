@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import numpy as np
 import os
 import torch
 import torch.cuda.amp as amp
@@ -59,9 +60,8 @@ def rope_apply(x, grid_sizes, freqs):
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-        dim=-1).reshape(seq_len, 1, -1)
-
-
+                            dim=-1).reshape(seq_len, 1, -1)
+        freqs_i = freqs_i.to(device=x_i.device)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
@@ -112,8 +112,7 @@ class WanSelfAttention(nn.Module):
                  num_heads,
                  window_size=(-1, -1),
                  qk_norm=True,
-                 eps=1e-6,
-                 enable_sp=False):
+                 eps=1e-6):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -122,7 +121,6 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.enable_sp = enable_sp
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -141,7 +139,6 @@ class WanSelfAttention(nn.Module):
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
             return q, k, v
-
         q, k, v = qkv_fn(x)
 
         q = rope_apply(q, grid_sizes, freqs)
@@ -161,7 +158,7 @@ class WanSelfAttention(nn.Module):
         x = self.o(x)
         with torch.no_grad():
             x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
-                                                    ref_target_masks=ref_target_masks, enable_sp=self.enable_sp)
+                                                    ref_target_masks=ref_target_masks)
 
         return x, x_ref_attn_map
 
@@ -217,8 +214,7 @@ class WanAttentionBlock(nn.Module):
                  output_dim=768,
                  norm_input_visual=True,
                  class_range=24,
-                 class_interval=4,
-                 enable_sp=False):
+                 class_interval=4):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -230,8 +226,7 @@ class WanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
-                                          eps, enable_sp)
+        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -258,12 +253,10 @@ class WanAttentionBlock(nn.Module):
                 eps=eps,
                 norm_layer=WanRMSNorm,
                 class_range=class_range,
-                class_interval=class_interval,
-                enable_sp=enable_sp,
+                class_interval=class_interval
             )
         self.norm_x = WanLayerNorm(dim, eps, elementwise_affine=True)  if norm_input_visual else nn.Identity()
 
-        self.enable_sp = enable_sp
 
     def forward(
         self,
@@ -276,13 +269,13 @@ class WanAttentionBlock(nn.Module):
         context_lens,
         audio_embedding=None,
         ref_target_masks=None,
-
+        human_num=None,
     ):
 
         dtype = x.dtype
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + e).chunk(6, dim=1)
+            e = (self.modulation.to(e.device) + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
         # self-attention
@@ -299,7 +292,7 @@ class WanAttentionBlock(nn.Module):
 
         # cross attn of audio
         x_a = self.audio_cross_attn(self.norm_x(x), encoder_hidden_states=audio_embedding,
-                                        shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map)
+                                        shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
         x = x + x_a
 
         y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype))
@@ -337,7 +330,7 @@ class Head(nn.Module):
         """
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+            e = (self.modulation.to(e.device) + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
 
@@ -457,9 +450,7 @@ class WanModel(ModelMixin, ConfigMixin):
                  vae_scale=4, # vae timedownsample scale
 
                  norm_input_visual=True,
-                 norm_output_audio=True,
-
-                 enable_sp=False):
+                 norm_output_audio=True):
         super().__init__()
 
         assert model_type == 'i2v', 'MultiTalk model requires your model_type is i2v.'
@@ -503,8 +494,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.blocks = nn.ModuleList([
             WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                               window_size, qk_norm, cross_attn_norm, eps,
-                              output_dim=output_dim, norm_input_visual=norm_input_visual,
-                              enable_sp=enable_sp)
+                              output_dim=output_dim, norm_input_visual=norm_input_visual)
             for _ in range(num_layers)
         ])
 
@@ -539,22 +529,59 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-    def forward(
+    def teacache_init(
         self,
-        x,
-        t,
-        context,
-        seq_len,
-        clip_fea=None,
-        y=None,
-        audio=None,
-        ref_target_masks=None,
+        use_ret_steps=True,
+        teacache_thresh=0.2,
+        sample_steps=40,
+        model_scale='multitalk-480',
     ):
+        print("teacache_init")
+        self.enable_teacache = True
+
+        self.__class__.cnt = 0
+        self.__class__.num_steps = sample_steps*3
+        self.__class__.teacache_thresh = teacache_thresh
+        self.__class__.accumulated_rel_l1_distance_even = 0
+        self.__class__.accumulated_rel_l1_distance_odd = 0
+        self.__class__.previous_e0_even = None
+        self.__class__.previous_e0_odd = None
+        self.__class__.previous_residual_even = None
+        self.__class__.previous_residual_odd = None
+        self.__class__.use_ret_steps = use_ret_steps
+
+        if use_ret_steps:
+            if model_scale == 'multitalk-480':
+                self.__class__.coefficients = [ 2.57151496e+05, -3.54229917e+04,  1.40286849e+03, -1.35890334e+01, 1.32517977e-01]
+            if model_scale == 'multitalk-720':
+                self.__class__.coefficients = [ 8.10705460e+03,  2.13393892e+03, -3.72934672e+02,  1.66203073e+01, -4.17769401e-02]
+            self.__class__.ret_steps = 5*3
+            self.__class__.cutoff_steps = sample_steps*3
+        else:
+            if model_scale == 'multitalk-480':
+                self.__class__.coefficients = [-3.02331670e+02,  2.23948934e+02, -5.25463970e+01,  5.87348440e+00, -2.01973289e-01]
+
+            if model_scale == 'multitalk-720':
+                self.__class__.coefficients = [-114.36346466,   65.26524496,  -18.82220707,    4.91518089,   -0.23412683]
+            self.__class__.ret_steps = 1*3
+            self.__class__.cutoff_steps = sample_steps*3 - 3
+        print("teacache_init done")
+
+    def disable_teacache(self):
+        self.enable_teacache = False
+
+    def forward(
+            self,
+            x,
+            t,
+            context,
+            seq_len,
+            clip_fea=None,
+            y=None,
+            audio=None,
+            ref_target_masks=None,
+        ):
         assert clip_fea is not None and y is not None
-        # params
-        device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         _, T, H, W = x[0].shape
         N_t = T // self.patch_size[0]
@@ -564,7 +591,6 @@ class WanModel(ModelMixin, ConfigMixin):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
         x[0] = x[0].to(context[0].dtype)
-        t = t.to(context[0].dtype)
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -613,6 +639,7 @@ class WanModel(ModelMixin, ConfigMixin):
         latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
         latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
         audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+        human_num = len(audio_embedding) ## I think this is not correct, it should be len(audio_embedding[0]) i think, need to test
         batch_size = audio_embedding.shape[0]
         audio_embeddings = []
         for i in range(batch_size):
@@ -631,6 +658,49 @@ class WanModel(ModelMixin, ConfigMixin):
             token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
             token_ref_target_masks = token_ref_target_masks.to(x.dtype)
 
+        # teacache
+        if self.enable_teacache:
+            modulated_inp = e0 if self.use_ret_steps else e
+            if self.cnt%3==0: # cond
+                if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                    should_calc_cond = True
+                    self.accumulated_rel_l1_distance_cond = 0
+                else:
+                    rescale_func = np.poly1d(self.coefficients)
+                    self.accumulated_rel_l1_distance_cond += rescale_func(((modulated_inp-self.previous_e0_cond).abs().mean() / self.previous_e0_cond.abs().mean()).cpu().item())
+                    if self.accumulated_rel_l1_distance_cond < self.teacache_thresh:
+                        should_calc_cond = False
+                    else:
+                        should_calc_cond = True
+                        self.accumulated_rel_l1_distance_cond = 0
+                self.previous_e0_cond = modulated_inp.clone()
+            elif self.cnt%3==1: # drop_text
+                if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                    should_calc_drop_text = True
+                    self.accumulated_rel_l1_distance_drop_text = 0
+                else:
+                    rescale_func = np.poly1d(self.coefficients)
+                    self.accumulated_rel_l1_distance_drop_text += rescale_func(((modulated_inp-self.previous_e0_drop_text).abs().mean() / self.previous_e0_drop_text.abs().mean()).cpu().item())
+                    if self.accumulated_rel_l1_distance_drop_text < self.teacache_thresh:
+                        should_calc_drop_text = False
+                    else:
+                        should_calc_drop_text = True
+                        self.accumulated_rel_l1_distance_drop_text = 0
+                self.previous_e0_drop_text = modulated_inp.clone()
+            else: # uncond
+                if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                    should_calc_uncond = True
+                    self.accumulated_rel_l1_distance_uncond = 0
+                else:
+                    rescale_func = np.poly1d(self.coefficients)
+                    self.accumulated_rel_l1_distance_uncond += rescale_func(((modulated_inp-self.previous_e0_uncond).abs().mean() / self.previous_e0_uncond.abs().mean()).cpu().item())
+                    if self.accumulated_rel_l1_distance_uncond < self.teacache_thresh:
+                        should_calc_uncond = False
+                    else:
+                        should_calc_uncond = True
+                        self.accumulated_rel_l1_distance_uncond = 0
+                self.previous_e0_uncond = modulated_inp.clone()
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -640,19 +710,50 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             audio_embedding=audio_embedding,
-            ref_target_masks=token_ref_target_masks
+            ref_target_masks=token_ref_target_masks,
+            human_num=human_num,
             )
-
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        if self.enable_teacache:
+            if self.cnt%3==0:
+                if not should_calc_cond:
+                    x +=  self.previous_residual_cond
+                else:
+                    ori_x = x.clone()
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    self.previous_residual_cond = x - ori_x
+            elif self.cnt%3==1:
+                if not should_calc_drop_text:
+                    x +=  self.previous_residual_drop_text
+                else:
+                    ori_x = x.clone()
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    self.previous_residual_drop_text = x - ori_x
+            else:
+                if not should_calc_uncond:
+                    x +=  self.previous_residual_uncond
+                else:
+                    ori_x = x.clone()
+                    for block in self.blocks:
+                        x = block(x, **kwargs)
+                    self.previous_residual_uncond = x - ori_x
+        else:
+            for block in self.blocks:
+                x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        if self.enable_teacache:
+            self.cnt += 1
+            if self.cnt >= self.num_steps:
+                self.cnt = 0
 
         return torch.cat(x, dim=0).float()
+
 
     def unpatchify(self, x, grid_sizes):
         r"""
