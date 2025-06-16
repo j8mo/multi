@@ -311,7 +311,7 @@ def usp_dit_forward_multitalk(
     latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 2, 12, 768
     latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) # [B, (T-1)//vae_scale, W-1+vae_scale, S, C_a] # 2, 20, 8, 12, 768
     audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) # [2, 1, 5, 12, 768] [2, 20, 8, 12, 768] --> 2, 21, 32, 768
-    human_num = len(audio_embedding)
+    human_num = len(audio_embedding) ## I think this is wrong, this should be len(audio_embedding[0]) instead of len(audio_embedding)
     batch_size = audio_embedding.shape[0]
     audio_embeddings = []
     for i in range(batch_size):
