@@ -1,6 +1,6 @@
 from PIL import Image
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 from wan.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan import MultiTalkPipeline
 
@@ -31,7 +31,7 @@ def create_pipeline(
         # If the model path is a local path, we don't need to download it
         multitalk_model_path = multitalk_model
     else:
-        multitalk_model_path = hf_hub_download(
+        multitalk_model_path = snapshot_download(
             multitalk_model,
             cache_dir=cache_dir
         )
@@ -116,15 +116,33 @@ def test_helper(use_usp = True, ulysses_size=1, ring_size=1, para_batch_size=1):
         audio_type="para",
     )
 
+    model_scale = 'multitalk-480'
+    use_teacache = True
+    teacache_thresh = 0.5
+
+    use_apg = True
+    apg_momentum = -0.75
+    apg_norm_threshold = 55
+
+    from types import SimpleNamespace
+
+    extra_args = SimpleNamespace()
+    extra_args.use_teacache = use_teacache
+    extra_args.teacache_thresh = teacache_thresh
+    extra_args.size = model_scale
+    extra_args.use_apg = use_apg
+    extra_args.apg_momentum = apg_momentum
+    extra_args.apg_norm_threshold = apg_norm_threshold
+
     for i in range(2):
         with parallel_context(pipeline.model, use_usp=use_usp, ulysses_size=ulysses_size, ring_size=ring_size, para_batch_size=para_batch_size) as sp_size:
             video = pipeline.generate(
                 input_data,
-                size_buckget='multitalk-480',
+                size_buckget=model_scale,
                 motion_frame=25,
                 frame_num=81,
                 shift=5.0,
-                sampling_steps=40,
+                sampling_steps=10,
                 text_guide_scale=5.0,
                 audio_guide_scale=4.0,
                 n_prompt="",
@@ -133,7 +151,8 @@ def test_helper(use_usp = True, ulysses_size=1, ring_size=1, para_batch_size=1):
                 max_frames_num=1000,
                 face_scale=0.05,
                 progress=True,
-                batched_cfg=True
+                batched_cfg=True,
+                extra_args=extra_args
             )
 
         save_video_ffmpeg(video, f"test_{i}.mp4", [input_data['video_audio']])
@@ -159,5 +178,5 @@ if __name__ == "__main__":
         world_size=world_size
     )
 
-    test_helper(use_usp=True, ulysses_size=1, ring_size=1, para_batch_size=3)
+    test_helper(use_usp=True, ulysses_size=1, ring_size=1, para_batch_size=1)
     # test(use_usp=False)  # Uncomment to test without USP
