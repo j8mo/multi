@@ -239,7 +239,8 @@ class SingleStreamAttention(nn.Module):
             q = self.q_norm(q)
 
         # get kv from encoder_hidden_states
-        _, N_a, _ = encoder_hidden_states.shape
+        # _ ,_, N_a, _ = encoder_hidden_states.shape
+        N_a = encoder_hidden_states.shape[-2]
         encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)
         encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
@@ -335,25 +336,28 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         if self.qk_norm:
             q = self.q_norm(q)
 
-        max_values = x_ref_attn_map.max(1).values[:, None, None]
-        min_values = x_ref_attn_map.min(1).values[:, None, None]
-        max_min_values = torch.cat([max_values, min_values], dim=2)
+        batch_size = B // N_t
+        normalized_maps = []
+        normalized_postions = []
+        for i in range(batch_size):
+            x_ref_attn_m = x_ref_attn_map[i]
+            max_values = x_ref_attn_m.max(1).values[:, None, None]
+            min_values = x_ref_attn_m.min(1).values[:, None, None]
+            max_min_values = torch.cat([max_values, min_values], dim=2)
 
-        human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
-        human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
+            human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
+            human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
 
-        human1 = normalize_and_scale(x_ref_attn_map[:, 0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
-        human2 = normalize_and_scale(x_ref_attn_map[:, 1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
-        back   = torch.full_like(human2, self.rope_bak)
-        max_indices = x_ref_attn_map.argmax(dim=1)
-        normalized_map = torch.stack([human1, human2, back], dim=1)
-
-        # Create batch and position indices
-        batch_size, _, L = normalized_map.shape
-        batch_idx = torch.arange(batch_size).unsqueeze(1).expand(batch_size, L)      # [N, L]
-        pos_idx   = torch.arange(L).unsqueeze(0).expand(batch_size, L)      # [N, L]
-        # Use advanced indexing to get normalized_map[n, max_indices[n, l], l]
-        normalized_pos = normalized_map[batch_idx, max_indices, pos_idx]  # [N, L]
+            human1 = normalize_and_scale(x_ref_attn_m[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
+            human2 = normalize_and_scale(x_ref_attn_m[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
+            back   = torch.full((x_ref_attn_m.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
+            max_indices = x_ref_attn_m.argmax(dim=0)
+            normalized_map = torch.stack([human1, human2, back], dim=1)
+            normalized_pos = normalized_map[range(x_ref_attn_m.size(1)), max_indices] # N
+            normalized_maps.append(normalized_map)
+            normalized_postions.append(normalized_pos)
+        normalized_map = torch.stack(normalized_maps, dim=0)
+        normalized_pos = torch.stack(normalized_postions, dim=0)
 
         q = rearrange(q, "(B N_t) H S C -> B H (N_t S) C", N_t=N_t)
         q = self.rope_1d(q, normalized_pos)

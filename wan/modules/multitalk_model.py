@@ -583,6 +583,7 @@ class WanModel(ModelMixin, ConfigMixin):
         ):
         assert clip_fea is not None and y is not None
 
+        batch_size = len(x)
         _, T, H, W = x[0].shape
         N_t = T // self.patch_size[0]
         N_h = H // self.patch_size[1]
@@ -639,8 +640,7 @@ class WanModel(ModelMixin, ConfigMixin):
         latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
         latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
         audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
-        human_num = len(audio_embedding) ## I think this is not correct, it should be len(audio_embedding[0]) i think, need to test
-        batch_size = audio_embedding.shape[0]
+        human_num = len(audio_embedding) // batch_size## I think this is not correct, it should be len(audio_embedding[0]) i think, need to test
         audio_embeddings = []
         for i in range(batch_size):
             audio_embeddings.append(
