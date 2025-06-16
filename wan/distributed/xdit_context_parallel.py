@@ -563,15 +563,14 @@ def usp_crossattn_multi_forward_multitalk(self,
 
 
         # get q for hidden_state
-        B, N, C = x.shape
+        batch_size, N, C = x.shape
         q = self.q_linear(x)
-        q_shape = (B, N, self.num_heads, self.head_dim)
+        q_shape = (batch_size, N, self.num_heads, self.head_dim)
         q = q.view(q_shape).permute((0, 2, 1, 3))
 
         if self.qk_norm:
             q = self.q_norm(q)
 
-        batch_size = B // N_t
         normalized_maps = []
         normalized_postions = []
         for i in range(batch_size):
@@ -598,7 +597,7 @@ def usp_crossattn_multi_forward_multitalk(self,
         q = self.rope_1d(q, normalized_pos)
 
         encoder_kv = self.kv_linear(encoder_hidden_states)
-        encoder_kv_shape = (B, encoder_hidden_states.size(1), 2, self.num_heads, self.head_dim)
+        encoder_kv_shape = (batch_size, encoder_hidden_states.size(1), 2, self.num_heads, self.head_dim)
         encoder_kv = encoder_kv.view(encoder_kv_shape).permute((2, 0, 3, 1, 4))
         encoder_k, encoder_v = encoder_kv.unbind(0) # B H N C
 
@@ -609,7 +608,7 @@ def usp_crossattn_multi_forward_multitalk(self,
         per_frame = torch.zeros(audio_tokens_per_frame * human_num, dtype=encoder_k.dtype).to(encoder_k.device)
         per_frame[:audio_tokens_per_frame] = (self.rope_h1[0] + self.rope_h1[1]) / 2
         per_frame[audio_tokens_per_frame:] = (self.rope_h2[0] + self.rope_h2[1]) / 2
-        encoder_pos = torch.concat([per_frame]*N_a, dim=0)
+        encoder_pos = torch.stack([torch.concat([per_frame] * N_t, dim=0)] * batch_size, dim=0)
         encoder_k = self.rope_1d(encoder_k, encoder_pos)
 
         # get attn
@@ -621,7 +620,7 @@ def usp_crossattn_multi_forward_multitalk(self,
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
-        x_output_shape = (B, N, C)
+        x_output_shape = (batch_size, N, C)
         x = x.transpose(1, 2)
         x = x.reshape(x_output_shape)
         x = self.proj(x)
