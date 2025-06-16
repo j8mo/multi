@@ -592,7 +592,7 @@ class MultiTalkPipeline:
                         'audio': [
                             audio_embs,
                             audio_embs,
-                            torch.zeros_like(audio_embs)[-1:]
+                            torch.zeros_like(audio_embs)
                         ],
                         'ref_target_masks': ref_target_masks
                     }

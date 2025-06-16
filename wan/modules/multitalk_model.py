@@ -627,7 +627,7 @@ class WanModel(ModelMixin, ConfigMixin):
             context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
 
-        audio_conds = audio.to(device=x.device, dtype=x.dtype)
+        audio_conds = [a.to(device=x.device, dtype=x.dtype) for a in audio]
         audio_embedding = []
         if not isinstance(audio_conds, list):
             audio_conds = [audio_conds]
@@ -754,7 +754,9 @@ class WanModel(ModelMixin, ConfigMixin):
             if self.cnt >= self.num_steps:
                 self.cnt = 0
 
-        return torch.cat(x, dim=0).float()
+        x = torch.stack(x, dim=0).float()
+
+        return x
 
 
     def unpatchify(self, x, grid_sizes):
