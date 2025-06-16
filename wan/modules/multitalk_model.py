@@ -583,7 +583,6 @@ class WanModel(ModelMixin, ConfigMixin):
         ):
         assert clip_fea is not None and y is not None
 
-        batch_size = len(x)
         _, T, H, W = x[0].shape
         N_t = T // self.patch_size[0]
         N_h = H // self.patch_size[1]

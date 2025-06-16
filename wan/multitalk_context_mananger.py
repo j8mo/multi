@@ -16,36 +16,34 @@ from torch import distributed as dist
 def parallel_context(model, use_usp, ulysses_size, ring_size, para_batch_size):
     original_attn_forwards = []
     original_model_forward = model.forward
-    original_enable_sp = getattr(model, "enable_sp", False)
 
-    if use_usp:
+    if ulysses_size > 1 or ring_size > 1 or para_batch_size > 1:
         world_size=dist.get_world_size()
         rank = dist.get_rank()
-        if ulysses_size > 1 or ring_size > 1 or para_batch_size > 1:
-            assert ulysses_size * ring_size * para_batch_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
-            assert para_batch_size == 1 or para_batch_size == 3, f"The para_batch_size should be 1 or 3, but got {para_batch_size}."
+        assert ulysses_size * ring_size * para_batch_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
+        assert para_batch_size == 1 or para_batch_size == 3, f"The para_batch_size should be 1 or 3, but got {para_batch_size}."
 
-            init_distributed_environment(
-                rank=rank, world_size=world_size)
+        init_distributed_environment(
+            rank=rank, world_size=world_size)
 
-            initialize_model_parallel(
-                classifier_free_guidance_degree=para_batch_size,
-                sequence_parallel_degree = ulysses_size * ring_size,
-                ring_degree=ring_size,
-                ulysses_degree=ulysses_size,
+        initialize_model_parallel(
+            classifier_free_guidance_degree=para_batch_size,
+            sequence_parallel_degree = ulysses_size * ring_size,
+            ring_degree=ring_size,
+            ulysses_degree=ulysses_size,
+        )
+
+        # Save original attention forwards
+        for block in model.blocks:
+            original_attn_forwards.append(block.self_attn.forward)
+            block.self_attn.forward = types.MethodType(
+                usp_attn_forward_multitalk, block.self_attn
             )
 
-            # Save original attention forwards
-            for block in model.blocks:
-                original_attn_forwards.append(block.self_attn.forward)
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward_multitalk, block.self_attn
-                )
-
-            # Patch model forward
-            model.forward = types.MethodType(usp_dit_forward_multitalk, model)
-            model.enable_sp = True
-            sp_size = get_sequence_parallel_world_size()
+        # Patch model forward
+        model.forward = types.MethodType(usp_dit_forward_multitalk, model)
+        sp_size = get_sequence_parallel_world_size()
+        print("Using sequence parallel size:", sp_size)
     else:
         sp_size = 1
 
@@ -59,4 +57,3 @@ def parallel_context(model, use_usp, ulysses_size, ring_size, para_batch_size):
 
             # Restore model forward and original sp flag
             model.forward = original_model_forward
-            model.enable_sp = original_enable_sp

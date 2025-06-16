@@ -254,7 +254,7 @@ def usp_dit_forward_multitalk(
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
 
-    bs = x.shape[0]
+    bs = len(x)
     _, T, H, W = x[0].shape
     N_t = T // self.patch_size[0]
     N_h = H // self.patch_size[1]
@@ -297,29 +297,28 @@ def usp_dit_forward_multitalk(
         context = torch.concat([context_clip, context], dim=1)
 
     # get audio token
-    audio_embedding = None
-    audio_cond = audio.to(device=x.device, dtype=x.dtype)
-    first_frame_audio_emb_s = audio_cond[:, :1, ...] # [2, 1, 5, 12, 768]
-    latter_frame_audio_emb = audio_cond[:, 1:, ...] # [2, 80, 5, 12, 768]
-    latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) # 2, 20, 4, 5, 12, 768
-    middle_index = self.audio_window // 2
-    latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] # 2, 20, 1, 3, 12, 768
-    latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 3, 12, 768
-    latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] # 2, 20, 1, 3, 12, 768
-    latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 3, 12, 768
-    latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] # 2, 20, 2, 1, 12, 768
-    latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") # 2, 20, 2, 12, 768
-    latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) # [B, (T-1)//vae_scale, W-1+vae_scale, S, C_a] # 2, 20, 8, 12, 768
-    audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) # [2, 1, 5, 12, 768] [2, 20, 8, 12, 768] --> 2, 21, 32, 768
-    human_num = len(audio_embedding) ## I think this is wrong, this should be len(audio_embedding[0]) instead of len(audio_embedding)
-    batch_size = audio_embedding.shape[0]
-    audio_embeddings = []
-    for i in range(batch_size):
-        audio_embeddings.append(
-                torch.concat(audio_embedding[[i]].split(1), dim=2).to(x.dtype)
-        )
-    audio_embedding = torch.cat(audio_embeddings, dim=0)
+    audio_conds = [a.to(device=x.device, dtype=x.dtype) for a in audio]
+    audio_embedding = []
+    if not isinstance(audio_conds, list):
+        audio_conds = [audio_conds]
+    for audio_cond in audio_conds:
+        first_frame_audio_emb_s = audio_cond[:, :1, ...]
+        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
+        middle_index = self.audio_window // 2
+        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
+        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
+        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+        audio_embed = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+        human_num = len(audio_embed)
+        audio_embed = torch.concat(audio_embed.split(1), dim=2).to(x.dtype)
+        audio_embedding.append(audio_embed)
 
+    audio_embedding = torch.cat(audio_embedding, dim=0).to(x.dtype)
 
     # convert ref_target_masks to token_ref_target_masks
     if ref_target_masks is not None:
@@ -500,7 +499,8 @@ def usp_attn_forward_multitalk(self,
                      grid_sizes,
                      freqs,
                      dtype=torch.bfloat16,
-                     ref_target_masks=None):
+                     ref_target_masks=None,
+                     enable_sp=False):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -533,7 +533,7 @@ def usp_attn_forward_multitalk(self,
 
     with torch.no_grad():
         x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
-                                            ref_target_masks=ref_target_masks, enable_sp=self.enable_sp) # B S(N_t N_h Nw)
+                                            ref_target_masks=ref_target_masks, enable_sp=enable_sp) # B S(N_t N_h Nw)
 
     return x, x_ref_attn_map
 
@@ -545,7 +545,8 @@ def usp_crossattn_multi_forward_multitalk(self,
                                         encoder_hidden_states: torch.Tensor,  # 1, 21, 64, C
                                         shape=None,
                                         x_ref_attn_map=None,
-                                        human_num=None) -> torch.Tensor:
+                                        human_num=None,
+                                        enable_sp = False) -> torch.Tensor:
 
         N_t, N_h, N_w = shape
         sp_size = get_sequence_parallel_world_size()
@@ -558,7 +559,7 @@ def usp_crossattn_multi_forward_multitalk(self,
         kv_seq = [audio_tokens_per_frame * human_num] * N_a
 
         if human_num == 1:
-            return super(SingleStreamMutiAttention, self).forward(x, encoder_hidden_states, shape, enable_sp=True, kv_seq=kv_seq)
+            return super(SingleStreamMutiAttention, self).forward(x, encoder_hidden_states, shape, enable_sp=enable_sp, kv_seq=kv_seq)
 
 
         # get q for hidden_state
@@ -570,20 +571,30 @@ def usp_crossattn_multi_forward_multitalk(self,
         if self.qk_norm:
             q = self.q_norm(q)
 
-        max_values = x_ref_attn_map.max(1).values[:, None, None]
-        min_values = x_ref_attn_map.min(1).values[:, None, None]
-        max_min_values = torch.cat([max_values, min_values], dim=2)
-        max_min_values = get_sp_group().all_gather(max_min_values, dim=1)
+        batch_size = B // N_t
+        normalized_maps = []
+        normalized_postions = []
+        for i in range(batch_size):
+            x_ref_attn_m = x_ref_attn_map[i]
+            max_values = x_ref_attn_m.max(1).values[:, None, None]
+            min_values = x_ref_attn_m.min(1).values[:, None, None]
+            max_min_values = torch.cat([max_values, min_values], dim=2)
+            max_min_values = get_sp_group().all_gather(max_min_values, dim=1)
 
-        human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
-        human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
+            human1_max_value, human1_min_value = max_min_values[0, :, 0].max(), max_min_values[0, :, 1].min()
+            human2_max_value, human2_min_value = max_min_values[1, :, 0].max(), max_min_values[1, :, 1].min()
 
-        human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
-        human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
-        back   = torch.full((x_ref_attn_map.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
-        max_indices = x_ref_attn_map.argmax(dim=0)
-        normalized_map = torch.stack([human1, human2, back], dim=1)
-        normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] # N
+            human1 = normalize_and_scale(x_ref_attn_m[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
+            human2 = normalize_and_scale(x_ref_attn_m[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
+            back   = torch.full((x_ref_attn_m.size(1),), self.rope_bak, dtype=human1.dtype).to(human1.device)
+            max_indices = x_ref_attn_m.argmax(dim=0)
+            normalized_map = torch.stack([human1, human2, back], dim=1)
+            normalized_pos = normalized_map[range(x_ref_attn_m.size(1)), max_indices] # N
+            normalized_maps.append(normalized_map)
+            normalized_postions.append(normalized_pos)
+        normalized_map = torch.stack(normalized_maps, dim=0)
+        normalized_pos = torch.stack(normalized_postions, dim=0)
+
         q = self.rope_1d(q, normalized_pos)
 
         encoder_kv = self.kv_linear(encoder_hidden_states)
