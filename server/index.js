@@ -169,6 +169,32 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// Error handling middleware for multer and other errors
+app.use((error, req, res, next) => {
+  console.error('Express error:', error);
+  
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large. Maximum size is 10MB.' });
+    }
+    if (error.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: 'Unexpected file field. Only audio and image files are allowed.' });
+    }
+    return res.status(400).json({ error: 'File upload error: ' + error.message });
+  }
+  
+  if (error.message && error.message.includes('Only audio files are allowed')) {
+    return res.status(400).json({ error: 'Only audio files are allowed for audio upload' });
+  }
+  
+  if (error.message && error.message.includes('Only image files are allowed')) {
+    return res.status(400).json({ error: 'Only image files are allowed for image upload' });
+  }
+  
+  // Default error response
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 // Serve static files (generated videos)
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
