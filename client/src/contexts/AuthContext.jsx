@@ -19,6 +19,7 @@ export const AuthProvider = ({ children }) => {
   useEffect(() => {
     // Get initial session
     supabase.auth.getSession().then(({ data: { session } }) => {
+      console.log('Initial session check:', session?.user?.email || 'No session')
       setUser(session?.user ?? null)
       setLoading(false)
     })
@@ -38,6 +39,16 @@ export const AuthProvider = ({ children }) => {
         // Handle successful signin
         if (event === 'SIGNED_IN' && session?.user) {
           console.log('User signed in successfully:', session.user.email)
+          // Force redirect to dashboard after successful OAuth signin
+          if (window.location.hash.includes('access_token')) {
+            console.log('OAuth callback detected, redirecting to dashboard')
+            window.location.href = '/dashboard'
+          }
+        }
+        
+        // Handle token refresh
+        if (event === 'TOKEN_REFRESHED' && session?.user) {
+          console.log('Token refreshed for user:', session.user.email)
         }
       }
     )
