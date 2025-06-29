@@ -94,19 +94,6 @@ app.post('/api/generate-video', upload.fields([
     // Create unique job ID
     const jobId = Date.now() + '-' + Math.round(Math.random() * 1E9);
     
-    // Create input JSON for the Python script
-    const inputData = {
-      prompt: prompt,
-      cond_image: path.resolve(imageFile.path),
-      cond_audio: {
-        person1: path.resolve(audioFile.path)
-      },
-      audio_type: "add"
-    };
-
-    const inputJsonPath = path.join(__dirname, '../uploads', `input_${jobId}.json`);
-    fs.writeFileSync(inputJsonPath, JSON.stringify(inputData, null, 2));
-
     // Create database record for the video generation job
     const { data: videoRecord, error: dbError } = await supabase
       .from('generated_videos')
@@ -124,7 +111,7 @@ app.post('/api/generate-video', upload.fields([
 
     if (dbError) {
       console.error('Database error:', dbError);
-      return res.status(500).json({ error: 'Failed to create video record' });
+      return res.status(500).json({ error: 'Failed to create video record: ' + dbError.message });
     }
 
     console.log('Video record created:', videoRecord.id);
@@ -141,32 +128,6 @@ app.post('/api/generate-video', upload.fields([
     console.error('Video generation error:', error);
     res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
-});
-
-// Error handling middleware for multer and other errors
-app.use((error, req, res, next) => {
-  console.error('Express error:', error);
-  
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large. Maximum size is 10MB.' });
-    }
-    if (error.code === 'LIMIT_UNEXPECTED_FILE') {
-      return res.status(400).json({ error: 'Unexpected file field. Only audio and image files are allowed.' });
-    }
-    return res.status(400).json({ error: 'File upload error: ' + error.message });
-  }
-  
-  if (error.message && error.message.includes('Only audio files are allowed')) {
-    return res.status(400).json({ error: 'Only audio files are allowed for audio upload' });
-  }
-  
-  if (error.message && error.message.includes('Only image files are allowed')) {
-    return res.status(400).json({ error: 'Only image files are allowed for image upload' });
-  }
-  
-  // Default error response
-  res.status(500).json({ error: 'Internal server error' });
 });
 
 // Error handling middleware for multer and other errors
