@@ -24,6 +24,7 @@ function App() {
               <Routes>
                 <Route path="/" element={<Home />} />
                 <Route path="/login" element={<Login />} />
+                <Route path="/auth/callback" element={<AuthCallback />} />
                 <Route path="/pricing" element={<Pricing />} />
                 <Route 
                   path="/dashboard" 
